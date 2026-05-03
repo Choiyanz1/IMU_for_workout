@@ -9,7 +9,10 @@ import random
 
 import numpy as np
 import pandas as pd
-import torch
+try:
+    import torch
+except Exception:  # pragma: no cover - lightweight preprocessing-only runtime
+    torch = None
 
 
 @dataclass
@@ -68,8 +71,9 @@ class LabelEncoder:
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch is not None:
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
 
 
 def _ensure_datetime_or_numeric_time(series: pd.Series) -> np.ndarray:
@@ -80,6 +84,26 @@ def _ensure_datetime_or_numeric_time(series: pd.Series) -> np.ndarray:
     if dt.isna().all():
         raise ValueError("time column could not be parsed as numeric or datetime")
     return (dt.astype("int64") / 1e9).to_numpy(dtype=np.float64)
+
+
+def _auto_detect_time_unit(time_values: np.ndarray) -> float:
+    """Detect whether timestamps are in seconds, milliseconds, or microseconds.
+
+    Returns a divisor to convert to seconds.
+    Heuristic: compute median inter-sample interval and check which unit
+    gives a plausible sensor rate (1-1000 Hz).
+    """
+    if len(time_values) < 2:
+        return 1.0
+    diffs = np.diff(time_values)
+    median_diff = float(np.median(diffs[diffs > 0])) if np.any(diffs > 0) else 1.0
+
+    # Try each unit and see which gives a plausible sample rate
+    for divisor, unit_name in [(1.0, "seconds"), (1e3, "milliseconds"), (1e6, "microseconds")]:
+        rate = divisor / median_diff
+        if 1.0 <= rate <= 2000.0:
+            return divisor
+    return 1.0
 
 
 def resample_sequence(
@@ -93,6 +117,11 @@ def resample_sequence(
 
     if len(time_values) < 2:
         return df.copy().reset_index(drop=True)
+
+    # Auto-detect time unit and convert to seconds
+    divisor = _auto_detect_time_unit(time_values)
+    if divisor != 1.0:
+        time_values = time_values / divisor
 
     start_t, end_t = time_values[0], time_values[-1]
     step = 1.0 / float(target_rate_hz)
@@ -108,10 +137,25 @@ def resample_sequence(
     out = pd.DataFrame(resampled, columns=imu_columns)
     out[time_column] = new_t
 
+    # For non-IMU, non-time columns: use nearest-neighbor mapping when the
+    # column has multiple unique values (e.g. phase), otherwise broadcast.
+    nearest_idx = np.searchsorted(time_values, new_t, side="left").clip(0, len(time_values) - 1)
+    # Refine: pick the closer of left and left-1
+    left = np.maximum(nearest_idx - 1, 0)
+    right = nearest_idx
+    dist_left = np.abs(new_t - time_values[left])
+    dist_right = np.abs(new_t - time_values[right])
+    nearest_idx = np.where(dist_left <= dist_right, left, right)
+
     for col in df.columns:
         if col in imu_columns or col == time_column:
             continue
-        out[col] = df.iloc[0][col]
+        col_values = df[col].to_numpy()
+        if len(set(col_values[:20])) > 1 or len(set(col_values)) > 1:
+            # Column varies within the sequence → nearest-neighbor map
+            out[col] = col_values[nearest_idx]
+        else:
+            out[col] = col_values[0]
 
     return out.reset_index(drop=True)
 

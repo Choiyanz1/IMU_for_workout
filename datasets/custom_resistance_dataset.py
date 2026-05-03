@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Sequence, Tuple
@@ -48,12 +49,30 @@ def prepare_sequences_from_folder(
     feature_cfg: FeatureConfig,
     sample_rate_hz: int,
     csv_glob: str = "*.csv",
+    exclude_patterns: Sequence[str] | None = None,
+    include_actions: Sequence[str] | None = None,
 ) -> Tuple[List[pd.DataFrame], List[str]]:
     sequences: List[pd.DataFrame] = []
     subjects: List[str] = []
     skipped_files = 0
+    excluded_files = 0
+    action_filtered = 0
 
     for csv_path in sorted(data_dir.rglob(csv_glob)):
+        # Skip files matching any exclude pattern (checked against filename
+        # AND against every parent directory name relative to data_dir).
+        if exclude_patterns:
+            try:
+                rel_parts = csv_path.relative_to(data_dir).parts
+            except ValueError:
+                rel_parts = csv_path.parts
+            if any(
+                fnmatch.fnmatch(part, pat)
+                for part in rel_parts
+                for pat in exclude_patterns
+            ):
+                excluded_files += 1
+                continue
         df = load_csv_sequence(csv_path)
 
         # Best-effort recovery for datasets where some metadata columns are absent.
@@ -80,12 +99,24 @@ def prepare_sequences_from_folder(
             print(f"[WARN] Skipping empty/invalid file after dropna: {csv_path}")
             continue
 
+        # Filter by action type BEFORE expensive resample
+        if include_actions:
+            allowed = set(include_actions)
+            action_val = str(df.iloc[0][feature_cfg.label_column])
+            if action_val not in allowed:
+                action_filtered += 1
+                continue
+
         df = resample_sequence(
             df=df,
             imu_columns=feature_cfg.imu_columns,
             time_column=feature_cfg.time_column,
             target_rate_hz=sample_rate_hz,
         )
+        try:
+            df.attrs["source_path"] = str(csv_path.relative_to(data_dir))
+        except ValueError:
+            df.attrs["source_path"] = str(csv_path)
 
         sequences.append(df)
         subjects.append(str(df.iloc[0][feature_cfg.subject_column]))
@@ -93,6 +124,10 @@ def prepare_sequences_from_folder(
     if not sequences:
         raise FileNotFoundError(f"No CSV files found under {data_dir}")
 
+    if excluded_files:
+        print(f"[INFO] Excluded files by pattern: {excluded_files}")
+    if action_filtered:
+        print(f"[INFO] Filtered by action type: {action_filtered} (keeping: {sorted(include_actions)})")
     if skipped_files:
         print(f"[INFO] Skipped files: {skipped_files}")
 

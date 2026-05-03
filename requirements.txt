@@ -3,6 +3,7 @@ pandas
 torch
 scikit-learn
 PyYAML
+autogluon.tabular
 onnx==1.16.2
 onnxruntime
 ml-dtypes<0.5.0

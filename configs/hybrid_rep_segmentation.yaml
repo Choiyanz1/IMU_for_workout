@@ -1,0 +1,110 @@
+data:
+  data_dir: ./datasets/raw_data
+  csv_glob: "*.csv"
+  exclude_patterns: ["*whole_session*", "*_w", "*rest_after*"]
+  include_actions: [db_bench_press, db_rdl, db_weighted_crunch, one_arm_db_row]
+
+io:
+  output_dir: ./artifacts/action_classification
+  phase_output_dir: ./artifacts/phase_segmentation
+  rep_segmentation_output_dir: ./artifacts/rep_segmentation
+
+feature:
+  imu_columns: [ax, ay, az, gx, gy, gz]
+  label_column: action_type
+  subject_column: subject_id
+  time_column: sensor_ts
+
+segmentation:
+  # SDTW candidate generator. The hybrid pipeline relaxes `cost_threshold`
+  # via `hybrid.cost_threshold_scale` so the classifier sees more FPs to
+  # learn from; keep `max_overlap_iou` at the same value used for plain SDTW.
+  sdtw:
+    motion_columns: [ax, ay, az, gx, gy, gz, mx, my, mz]
+    smoothing_window: 9
+    min_point_gap: 8
+    point_value_epsilon: 0.08
+    min_scale_percent: 0.55
+    threshold_percentile: 60.0
+    threshold_margin: 0.02
+    duration_min_ratio: 0.55
+    duration_max_ratio: 1.75
+    max_overlap_iou: 0.20
+    max_candidates_per_endpoint: 30
+    template_middle_fraction: 0.50
+    template_min_edge_reps: 1
+    max_templates: 3
+
+hybrid:
+  # IoU threshold used when labeling training candidates as TP (1) vs FP (0).
+  # SDTW boundaries are typically off by 200-500 ms vs phase truth, so a strict
+  # 0.5 threshold mislabels many real reps as FP. 0.3 gives the classifier
+  # cleaner labels at the cost of slightly looser positive definition.
+  label_iou: 0.30
+
+  # Probability cutoff applied to classifier output before NMS.
+  # Lower values trade precision for recall. With subject-stratified validation
+  # the calibrated decision threshold is already conservative, so 0.3 here
+  # preserves recall on unseen subjects.
+  prob_threshold: 0.30
+
+  # Multiplier on the SDTW template cost threshold during candidate generation.
+  # Values > 1.0 admit more candidates (more FPs in training data, but better
+  # recall ceiling at inference). Try 1.5-2.0; 1.0 disables relaxation.
+  cost_threshold_scale: 1.5
+
+  # IoU used when running NMS on the classifier's kept candidates.
+  nms_iou: 0.20
+
+  # ----------------------------------------------------------------------
+  # Boundary refinement (third stage). After the classifier filters candidates,
+  # an AutoGluon regressor predicts a per-edge correction (in samples) that is
+  # applied to nudge the SDTW-proposed start/end indices closer to truth.
+  # ----------------------------------------------------------------------
+  enable_boundary_refiner: true
+  # Half-width (in samples) of the local IMU window around each predicted edge
+  # used to compute boundary regression features. ~20 samples is ~400 ms at
+  # 50 Hz. The refiner can move a boundary up to ±edge_window_samples.
+  edge_window_samples: 20
+  # Only candidates whose best IoU vs ground truth exceeds this threshold are
+  # used as regression training rows. Looser than `label_iou` is fine because
+  # we want examples with non-trivial overlap so the deltas are well-defined.
+  refiner_train_iou: 0.30
+  # Per-fold AutoGluon time budget for each of the two regressors (start/end).
+  refiner_time_limit_s: 90
+  # If a predicted delta is larger (in absolute samples) than this safety
+  # cap, fall back to the original SDTW boundary. Prevents pathological jumps.
+  refiner_max_shift_samples: 30
+
+  # AutoGluon settings (binary classifier).
+  # CAT (CatBoost) is enabled by default — strongest tabular model that works
+  # reliably on macOS arm64. GBM (LightGBM) and XGB (XGBoost) are excluded
+  # because their bundled wheels segfault when multiple libomp.dylib copies
+  # are present in the env (torch + sklearn + brew). Re-enable them once that
+  # is resolved. NN_TORCH / FASTAI are excluded because they are slow on CPU.
+  presets: medium_quality_faster_train
+  time_limit_s: 300
+  eval_metric: f1
+  num_cpus: null
+  memory_limit_gb: 4
+  included_model_types: null
+  excluded_model_types: [NN_TORCH, FASTAI, GBM, XGB]
+  num_bag_folds: 0
+  num_stack_levels: 0
+
+  # Disk-saving knobs. A LOSO sweep over 4 subjects x 4 actions x 2 modes
+  # creates 32 AutoGluon predictors; without these flags it can balloon to 8+ GB.
+  # `keep_only_best`  : drop non-winning models in each fold (~70% saving).
+  # `save_space`      : delete intermediate caches AutoGluon keeps for retraining.
+  # `delete_predictor_after_eval`: remove the fold's directory once test scoring
+  #                                is done. Set to false if you need to reuse
+  #                                predictors later (e.g. for inference).
+  keep_only_best: true
+  save_space: true
+  delete_predictor_after_eval: true
+
+  # Use one held-out *training* subject as AutoGluon's validation set instead
+  # of a random 10% holdout. This makes the inner model selection / decision-
+  # threshold calibration LOSO-aware and avoids the failure mode where a
+  # random validation set has near-identical distribution as training.
+  subject_stratified_validation: true

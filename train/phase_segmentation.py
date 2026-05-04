@@ -638,7 +638,7 @@ def train_phase(config_path: Path, dry_run: bool = False, use_timestamp: bool = 
     df_test["action_type"] = pd.Categorical(a_test)
 
     # Add relative position within the rep (0=start, 1=end)
-    # Eccentric is always the first phase, concentric the second.
+    # Concentric is always the first phase, eccentric the second.
     df_train["rel_pos"] = [m["rel_pos"] for m in m_train]
     df_test["rel_pos"] = [m["rel_pos"] for m in m_test]
 

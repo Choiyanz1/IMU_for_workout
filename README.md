@@ -280,6 +280,55 @@ artifacts/rep_segmentation/
       summary.json
 ```
 
+## DS-MS-TCN Micro/Macro Rep Segmentation
+
+This pipeline implements a DS-MS-TCN-style sequence-to-sequence recognizer for
+rep segmentation and action recognition. Stage 1 predicts fixed micro labels
+(`other`, `concentric`, `eccentric`) and reps are extracted only from the fixed
+order `concentric -> eccentric`. Stages 2-4 predict and refine macro labels
+(`other + action_type`), so the same model can also provide per-rep action
+labels.
+
+By default, `configs/micro_macro_recognition.yaml` runs both Stage 1 sources
+under the same timestamped output folder:
+
+```bash
+python -m train.micro_macro_recognition --config configs/micro_macro_recognition.yaml
+```
+
+Run only the learned Stage 1 TCN version:
+
+```bash
+python -m train.micro_macro_recognition --config configs/micro_macro_recognition.yaml --micro-source tcn
+```
+
+Run only the DTW Stage 1 comparison version:
+
+```bash
+python -m train.micro_macro_recognition --config configs/micro_macro_recognition.yaml --micro-source dtw
+```
+
+You can also switch the same setting in `configs/micro_macro_recognition.yaml`:
+
+```yaml
+micro_macro:
+  micro_source: both  # both | tcn | dtw
+```
+
+The CLI flag is only an override for quick comparisons; the fixed phase order
+`concentric -> eccentric` is intentionally not configurable.
+
+Artifacts are written under `./artifacts/micro_macro_recognition/`:
+
+- `models/ds_ms_tcn.pt`: trained four-stage model.
+- `detections/rep_detections_{tcn,dtw}.csv`: predicted reps with transition,
+  micro confidence, and predicted action label.
+- `detections/pairing_diagnostics_{tcn,dtw}.csv`: invalid or unpaired micro
+  runs such as missing eccentric segments.
+- `metrics/stream_metrics_{tcn,dtw}.csv`: rep-level segmentation metrics.
+- `metrics/rep_action_confusion_{tcn,dtw}.csv`: per-rep action confusion matrix.
+- `plots/{tcn,dtw}/*.svg`: waveform overlays for visual debugging.
+
 ## Student Model Artifacts (`io.output_dir`)
 
 - `student_best.pt`

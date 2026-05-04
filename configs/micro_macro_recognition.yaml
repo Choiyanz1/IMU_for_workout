@@ -1,0 +1,56 @@
+data:
+  data_dir: ./datasets/raw_data
+  csv_glob: "*.csv"
+  exclude_patterns: ["*whole_session*", "*_w", "*rest_after*"]
+  include_actions: [db_bench_press, db_rdl, db_weighted_crunch, one_arm_db_row]
+
+io:
+  micro_macro_output_dir: ./artifacts/micro_macro_recognition
+
+feature:
+  imu_columns: [ax, ay, az, gx, gy, gz]
+  label_column: action_type
+  subject_column: subject_id
+  time_column: sensor_ts
+
+window:
+  sample_rate_hz: 50
+
+train:
+  seed: 42
+  batch_size: 32
+  epochs: 30
+  lr: 0.0001
+  weight_decay: 0.00001
+  num_workers: 0
+  device: cpu
+
+micro_macro:
+  # Stage 1 source. "both" runs TCN and DTW comparison runs under the same timestamp.
+  # CLI --micro-source can override this for quick comparisons.
+  micro_source: both  # both | tcn | dtw
+  #
+  # Phase order is intentionally NOT configurable:
+  #   concentric -> eccentric
+  train_on_modes: [sets, whole]
+  slice_seconds: 40.0
+  overlap: 0.50
+  num_filters: 64
+  num_layers: 9
+  kernel_size: 3
+  dropout: 0.2
+  alpha: 1.0
+  beta: 0.15
+  tmse_threshold: 4.0
+  max_phase_gap_samples: 0
+  min_phase_samples: 3
+  plot_max_streams: 24
+
+  dtw:
+    smoothing_window: 7
+    duration_min_ratio: 0.55
+    duration_max_ratio: 1.75
+    threshold_percentile: 75.0
+    threshold_margin: 0.10
+    detection_stride: 3
+    max_overlap_iou: 0.20

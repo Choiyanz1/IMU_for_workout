@@ -1,1 +1,1 @@
-"""Training entrypoints for action, phase, student, and distillation models."""
+"""Training entrypoints for action, phase, rep, student, and distillation models."""

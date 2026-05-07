@@ -31,6 +31,8 @@ try:
 except Exception:  # pragma: no cover - fallback for lightweight runtimes
     yaml = None
 
+from evaluation.reporting import write_report
+from evaluation.reporting import primary_metric_table
 from preprocessing.sdtw_rep_segmentation import (
     SDTWConfig,
     SegmentDetection,
@@ -672,6 +674,8 @@ def evaluate(
     templates_df.to_csv(dirs["templates"] / "templates.csv", index=False)
 
     summary: Dict[str, object] = {
+        "task": "rep_segmentation",
+        "model_name": "sdtw",
         "mode": mode,
         "iou_threshold": iou_threshold,
         "config": asdict(sdtw_cfg),
@@ -690,6 +694,7 @@ def evaluate(
             summary["by_action"][str(action)] = _aggregate_metrics(group.to_dict("records"))
         for subject, group in metrics_df.groupby("test_subject"):
             summary["by_subject"][str(subject)] = _aggregate_metrics(group.to_dict("records"))
+    summary["primary_metrics"] = primary_metric_table(summary["overall"])
 
     (dirs["metrics"] / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     (dirs["metadata"] / "run_manifest.json").write_text(
@@ -728,6 +733,27 @@ def evaluate(
             ]
         ),
         encoding="utf-8",
+    )
+    write_report(
+        dirs["root"],
+        title=f"SDTW Rep Segmentation Report ({mode})",
+        task="rep_segmentation",
+        model_name="sdtw",
+        overall=summary["overall"],
+        artifacts={
+            "Summary JSON": (dirs["metrics"] / "summary.json").as_posix(),
+            "Stream metrics": (dirs["metrics"] / "stream_metrics.csv").as_posix(),
+            "Detections": (dirs["detections"] / "detections.csv").as_posix(),
+            "Templates": (dirs["templates"] / "templates.csv").as_posix(),
+            "Plots": dirs["plots"].as_posix() if make_plots else "disabled",
+        },
+        config={
+            "mode": mode,
+            "iou_threshold": iou_threshold,
+            "subjects": subjects,
+            "actions": include_actions,
+        },
+        notes=["Standardized report added for cross-model comparison."],
     )
 
     print("\n" + "=" * 72)

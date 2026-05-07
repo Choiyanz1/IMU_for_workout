@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Sequence
 
 import torch
 import torch.nn as nn
@@ -17,12 +17,15 @@ class DSMSTCNConfig:
     num_layers: int = 9
     kernel_size: int = 3
     dropout: float = 0.2
+    causal: bool = True
 
 
 class DilatedResidualLayer(nn.Module):
-    def __init__(self, channels: int, dilation: int, kernel_size: int, dropout: float) -> None:
+    def __init__(self, channels: int, dilation: int, kernel_size: int, dropout: float, causal: bool = True) -> None:
         super().__init__()
-        padding = dilation * (kernel_size - 1) // 2
+        self.causal = bool(causal)
+        self.left_padding = dilation * (kernel_size - 1)
+        padding = 0 if self.causal else self.left_padding // 2
         self.conv = nn.Conv1d(
             channels,
             channels,
@@ -34,7 +37,8 @@ class DilatedResidualLayer(nn.Module):
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = F.relu(self.conv(x))
+        conv_in = F.pad(x, (self.left_padding, 0)) if self.causal else x
+        out = F.relu(self.conv(conv_in))
         out = self.proj(out)
         return x + self.drop(out)
 
@@ -54,6 +58,7 @@ class SingleStageTCN(nn.Module):
         num_layers: int = 9,
         kernel_size: int = 3,
         dropout: float = 0.2,
+        causal: bool = True,
     ) -> None:
         super().__init__()
         self.input_proj = nn.Conv1d(input_channels, num_filters, kernel_size=1)
@@ -64,6 +69,7 @@ class SingleStageTCN(nn.Module):
                     dilation=2 ** i,
                     kernel_size=kernel_size,
                     dropout=dropout,
+                    causal=causal,
                 )
                 for i in range(num_layers)
             ]
@@ -96,6 +102,7 @@ class DSMSTCN(nn.Module):
             num_layers=cfg.num_layers,
             kernel_size=cfg.kernel_size,
             dropout=cfg.dropout,
+            causal=cfg.causal,
         )
         self.stage2_macro = SingleStageTCN(
             input_channels=cfg.micro_classes,
@@ -104,6 +111,7 @@ class DSMSTCN(nn.Module):
             num_layers=cfg.num_layers,
             kernel_size=cfg.kernel_size,
             dropout=cfg.dropout,
+            causal=cfg.causal,
         )
         self.stage3_macro = SingleStageTCN(
             input_channels=cfg.macro_classes,
@@ -112,6 +120,7 @@ class DSMSTCN(nn.Module):
             num_layers=cfg.num_layers,
             kernel_size=cfg.kernel_size,
             dropout=cfg.dropout,
+            causal=cfg.causal,
         )
         self.stage4_macro = SingleStageTCN(
             input_channels=cfg.macro_classes,
@@ -120,6 +129,7 @@ class DSMSTCN(nn.Module):
             num_layers=cfg.num_layers,
             kernel_size=cfg.kernel_size,
             dropout=cfg.dropout,
+            causal=cfg.causal,
         )
 
     def forward(
@@ -142,6 +152,53 @@ class DSMSTCN(nn.Module):
             "macro2_logits": macro2_logits,
             "macro3_logits": macro3_logits,
             "macro4_logits": macro4_logits,
+        }
+
+    def single_stage_receptive_field(self) -> int:
+        return 1 + (int(self.cfg.kernel_size) - 1) * sum(2 ** i for i in range(int(self.cfg.num_layers)))
+
+    def total_receptive_field(self, include_micro_stage: bool = True) -> int:
+        stages = 4 if include_micro_stage else 3
+        return 1 + stages * (self.single_stage_receptive_field() - 1)
+
+
+class OnlineDSMSTCNPredictor:
+    """Rolling-buffer causal inference helper.
+
+    This intentionally recomputes the small buffer on each update. It is simple
+    and useful for validating online behavior before optimizing deployment.
+    """
+
+    def __init__(
+        self,
+        model: DSMSTCN,
+        imu_columns: Sequence[str],
+        device: torch.device,
+        buffer_size: int | None = None,
+    ) -> None:
+        if not model.cfg.causal:
+            raise ValueError("OnlineDSMSTCNPredictor requires a causal DSMSTCN model.")
+        self.model = model
+        self.imu_columns = list(imu_columns)
+        self.device = device
+        self.buffer_size = int(buffer_size or model.total_receptive_field(include_micro_stage=True))
+        self.buffer: List[torch.Tensor] = []
+        self.model.eval()
+
+    def reset(self) -> None:
+        self.buffer.clear()
+
+    def update(self, sample: Sequence[float]) -> Dict[str, torch.Tensor]:
+        x = torch.as_tensor(sample, dtype=torch.float32)
+        self.buffer.append(x)
+        if len(self.buffer) > self.buffer_size:
+            self.buffer = self.buffer[-self.buffer_size :]
+        seq = torch.stack(self.buffer, dim=0)[None, :, :].to(self.device)
+        with torch.no_grad():
+            out = self.model(seq)
+        return {
+            "micro_probs": out["micro_probs"][0, -1].detach().cpu(),
+            "macro4_probs": torch.softmax(out["macro4_logits"], dim=-1)[0, -1].detach().cpu(),
         }
 
 

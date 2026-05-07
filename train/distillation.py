@@ -25,6 +25,7 @@ from sklearn.metrics import accuracy_score, f1_score
 from torch.utils.data import DataLoader, Dataset
 
 from datasets.custom_resistance_dataset import FeatureConfig, filter_sequences_by_subject, prepare_sequences_from_folder
+from evaluation.reporting import write_standard_run_outputs
 from models.inertial_student import InertialStudent, ModelConfig
 from preprocessing.window_pipeline import (
     WindowConfig,
@@ -384,6 +385,30 @@ def distill_from_autogluon(config_path: Path, use_timestamp: bool = True) -> Non
         "test_metrics": metrics,
     }
     (distill_output_dir / "distill_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    write_standard_run_outputs(
+        distill_output_dir,
+        task="action_classification",
+        model_name="inertial_student_distilled",
+        title="Distilled Student Model Report",
+        overall=metrics,
+        details={"legacy_summary": summary},
+        artifacts={
+            "Legacy summary": (distill_output_dir / "distill_summary.json").as_posix(),
+            "Checkpoint": (distill_output_dir / "student_distilled.pt").as_posix(),
+            "Z-score stats": (distill_output_dir / "zscore_stats.json").as_posix(),
+            "Label map": (distill_output_dir / "label_map.json").as_posix(),
+        },
+        config={
+            "teacher_output": ag_output_dir.as_posix(),
+            "temperature": distill_cfg.temperature,
+            "alpha": distill_cfg.alpha,
+            "train_subjects": train_subj,
+            "val_subjects": val_subj,
+            "test_subjects": test_subj,
+        },
+        config_path=config_path,
+        notes=["Standardized report added for cross-model comparison."],
+    )
     print(f"\nSaved distilled model: {distill_output_dir / 'student_distilled.pt'}")
 
 

@@ -15,6 +15,7 @@ from sklearn.metrics import accuracy_score, f1_score
 from torch.utils.data import DataLoader, Dataset
 
 from datasets.custom_resistance_dataset import FeatureConfig, filter_sequences_by_subject, prepare_sequences_from_folder
+from evaluation.reporting import write_standard_run_outputs
 from models.inertial_student import InertialStudent, ModelConfig
 from preprocessing.window_pipeline import (
     WindowConfig,
@@ -257,6 +258,30 @@ def train_student(config_path: Path, use_timestamp: bool = True) -> None:
         "test_metrics": metrics,
     }
     (output_dir / "train_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    write_standard_run_outputs(
+        output_dir,
+        task="action_classification",
+        model_name="inertial_student",
+        title="Student Model Report",
+        overall=metrics,
+        details={"legacy_summary": summary},
+        artifacts={
+            "Legacy summary": (output_dir / "train_summary.json").as_posix(),
+            "Checkpoint": (output_dir / "student_best.pt").as_posix(),
+            "Z-score stats": (output_dir / "zscore_stats.json").as_posix(),
+            "Label map": (output_dir / "label_map.json").as_posix(),
+            "Effective config": (output_dir / "effective_config.json").as_posix(),
+        },
+        config={
+            "train_subjects": train_subj,
+            "val_subjects": val_subj,
+            "test_subjects": test_subj,
+            "window_size": window_cfg.window_size,
+            "stride_size": window_cfg.stride_size,
+        },
+        config_path=config_path,
+        notes=["Standardized report added for cross-model comparison."],
+    )
 
     effective_cfg = {
         "feature": feature_cfg.__dict__,

@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import json
+import os
 import shutil
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -22,6 +23,7 @@ from torch.utils.data import DataLoader, Dataset
 import yaml
 
 from models.ds_ms_tcn import DSMSTCN, DSMSTCNConfig, ds_ms_tcn_loss
+from evaluation.reporting import primary_metric_table, write_run_manifest
 from preprocessing.dtw_micro_adapter import (
     DTWMicroConfig,
     detect_dtw_micro_runs,
@@ -35,6 +37,7 @@ from preprocessing.micro_macro_segments import (
     OTHER_LABEL,
     aggregate_action_for_reps,
     diagnostics_to_rows,
+    edit_score,
     labels_to_runs,
     macro_labels_from_action,
     match_segments,
@@ -42,7 +45,10 @@ from preprocessing.micro_macro_segments import (
     pair_concentric_eccentric_reps,
     rep_metrics,
     reps_to_rows,
+    sample_classification_metrics,
+    segment_iou_f1,
     truth_reps_from_labels,
+    write_action_prediction_svg,
     write_micro_macro_svg,
 )
 from preprocessing.sdtw_rep_segmentation import infer_sample_rate_hz
@@ -57,6 +63,7 @@ class MicroMacroConfig:
     num_layers: int = 9
     kernel_size: int = 3
     dropout: float = 0.2
+    causal: bool = True
     alpha: float = 1.0
     beta: float = 0.15
     tmse_threshold: float = 4.0
@@ -73,8 +80,43 @@ class TrainConfig:
     epochs: int = 30
     lr: float = 0.0001
     weight_decay: float = 0.00001
-    num_workers: int = 0
-    device: str = "cpu"
+    test_subject: str | None = None
+    num_workers: int | str = "auto"
+    device: str = "auto"
+    pin_memory: bool | str = "auto"
+    amp: bool = True
+
+
+def _resolve_device(device_setting: str) -> torch.device:
+    requested = str(device_setting).lower()
+    if requested == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    if requested == "cuda" and not torch.cuda.is_available():
+        print("[WARN] CUDA requested but unavailable; falling back to CPU.")
+        return torch.device("cpu")
+    if requested == "mps" and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+        print("[WARN] MPS requested but unavailable; falling back to CPU.")
+        return torch.device("cpu")
+    return torch.device(requested)
+
+
+def _resolve_num_workers(num_workers: int | str, device: torch.device) -> int:
+    if str(num_workers).lower() != "auto":
+        return max(0, int(num_workers))
+    cpu_count = os.cpu_count() or 1
+    if device.type == "cpu":
+        return max(0, min(2, cpu_count - 1))
+    return max(0, min(4, cpu_count - 1))
+
+
+def _resolve_pin_memory(pin_memory: bool | str, device: torch.device) -> bool:
+    if isinstance(pin_memory, str) and pin_memory.lower() == "auto":
+        return device.type == "cuda"
+    return bool(pin_memory)
 
 
 class SequenceSliceDataset(Dataset):
@@ -196,6 +238,7 @@ def _load_set_sequences(
                 df["action_type"] = action
             if "subject_id" not in df.columns:
                 df["subject_id"] = subject
+            df["_split_subject"] = subject
             df["_source_file"] = csv_path.name
             frames.append(df)
         if frames:
@@ -220,6 +263,7 @@ def _load_whole_sequences(
         df = df.copy()
         if "subject_id" not in df.columns:
             df["subject_id"] = subject
+        df["_split_subject"] = subject
         df.loc[~df["action_type"].astype(str).isin(allowed), "action_type"] = OTHER_LABEL
         streams.append((f"{subject}/{csv_path.stem}", df))
     return streams
@@ -245,7 +289,8 @@ def _filter_subjects(streams: Sequence[Tuple[str, pd.DataFrame]], subjects: Sequ
     allowed = set(str(s) for s in subjects)
     out = []
     for stream_id, df in streams:
-        if subject_column in df.columns and str(df.iloc[0][subject_column]) in allowed:
+        split_subject = str(df.iloc[0]["_split_subject"]) if "_split_subject" in df.columns else str(df.iloc[0][subject_column])
+        if split_subject in allowed:
             out.append((stream_id, df))
     return out
 
@@ -274,6 +319,18 @@ def _predict_full_sequence(
     }
 
 
+def _median_sample_rate(streams: Sequence[Tuple[str, pd.DataFrame]], fallback_hz: float) -> float:
+    rates = []
+    for _, df in streams:
+        try:
+            rate = float(infer_sample_rate_hz(df))
+        except Exception:
+            continue
+        if np.isfinite(rate) and rate > 0:
+            rates.append(rate)
+    return float(np.median(rates)) if rates else float(fallback_hz)
+
+
 def _macro_runs_from_probs(probs: np.ndarray, macro_classes: Sequence[str], min_length: int = 1):
     labels = [macro_classes[int(i)] for i in np.argmax(probs, axis=1)]
     return labels_to_runs(labels, positive_labels=None, probabilities=None, min_length=min_length)
@@ -299,29 +356,34 @@ def _train_model(
 ) -> None:
     device = torch.device(cfg.device)
     model.to(device)
+    use_amp = bool(cfg.amp) and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg.lr), weight_decay=float(cfg.weight_decay))
     for epoch in range(1, int(cfg.epochs) + 1):
         model.train()
         total = 0.0
         count = 0
         for x, micro, macro, gt_micro_probs in loader:
-            x = x.to(device)
-            micro = micro.to(device)
-            macro = macro.to(device)
-            gt_micro_probs = gt_micro_probs.to(device)
+            non_blocking = device.type == "cuda"
+            x = x.to(device, non_blocking=non_blocking)
+            micro = micro.to(device, non_blocking=non_blocking)
+            macro = macro.to(device, non_blocking=non_blocking)
+            gt_micro_probs = gt_micro_probs.to(device, non_blocking=non_blocking)
             optimizer.zero_grad()
-            out = model(x, external_micro_probs=gt_micro_probs if use_gt_micro_probs else None)
-            losses = ds_ms_tcn_loss(
-                out,
-                micro,
-                macro,
-                alpha=mm_cfg.alpha,
-                beta=mm_cfg.beta,
-                tmse_threshold=mm_cfg.tmse_threshold,
-                include_micro_loss=not use_gt_micro_probs,
-            )
-            losses["loss"].backward()
-            optimizer.step()
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                out = model(x, external_micro_probs=gt_micro_probs if use_gt_micro_probs else None)
+                losses = ds_ms_tcn_loss(
+                    out,
+                    micro,
+                    macro,
+                    alpha=mm_cfg.alpha,
+                    beta=mm_cfg.beta,
+                    tmse_threshold=mm_cfg.tmse_threshold,
+                    include_micro_loss=not use_gt_micro_probs,
+                )
+            scaler.scale(losses["loss"]).backward()
+            scaler.step(optimizer)
+            scaler.update()
             total += float(losses["loss"].detach().cpu()) * len(x)
             count += len(x)
         print(f"[INFO] epoch={epoch:03d} loss={total / max(1, count):.4f}")
@@ -351,17 +413,44 @@ def _evaluate_streams(
     pred_actions: List[str] = []
     plot_count = 0
 
-    for stream_id, df in streams:
+    for stream_idx, (stream_id, df) in enumerate(streams, start=1):
         sample_rate = infer_sample_rate_hz(df)
         if micro_source == "dtw":
-            dtw_runs = detect_dtw_micro_runs(df, dtw_templates, imu_columns, dtw_cfg)
+            print(
+                f"[INFO] DTW eval {stream_idx}/{len(streams)} stream={stream_id} "
+                f"samples={len(df)} stride={dtw_cfg.detection_stride} "
+                f"duration_stride={dtw_cfg.duration_stride or dtw_cfg.detection_stride} "
+                f"downsample={dtw_cfg.dtw_downsample_factor} "
+                f"max_windows_per_label={dtw_cfg.max_windows_per_label}",
+                flush=True,
+            )
+            dtw_runs, dtw_stats = detect_dtw_micro_runs(
+                df,
+                dtw_templates,
+                imu_columns,
+                dtw_cfg,
+                return_stats=True,
+            )
+            print(
+                f"[INFO] DTW eval {stream_idx}/{len(streams)} stream={stream_id} "
+                f"windows={dtw_stats.get('windows_scored', 0)} "
+                f"candidates={dtw_stats.get('candidates', 0)} kept={dtw_stats.get('kept', 0)}",
+                flush=True,
+            )
             external = dtw_runs_to_micro_scores(len(df), dtw_runs)
             pred = _predict_full_sequence(model, df, imu_columns, device, external_micro=external)
         else:
+            print(f"[INFO] TCN eval {stream_idx}/{len(streams)} stream={stream_id} samples={len(df)}", flush=True)
             pred = _predict_full_sequence(model, df, imu_columns, device)
         micro_probs = pred["micro_probs"]
         macro_probs = pred["macro4_probs"]
         pred_micro_labels = [MICRO_LABELS[int(i)] for i in np.argmax(micro_probs, axis=1)]
+        gt_micro_labels = micro_labels_from_phase(df["phase"].to_numpy())
+        gt_macro_labels = macro_labels_from_action(
+            df["action_type"].astype(str).to_numpy() if "action_type" in df.columns else [OTHER_LABEL] * len(df),
+            gt_micro_labels,
+        )
+        pred_macro_labels = [macro_classes[int(i)] for i in np.argmax(macro_probs, axis=1)]
         pred_micro_runs = labels_to_runs(
             pred_micro_labels,
             positive_labels=(CONCENTRIC_LABEL, ECCENTRIC_LABEL),
@@ -379,8 +468,40 @@ def _evaluate_streams(
             actions=df["action_type"].astype(str).to_numpy() if "action_type" in df.columns else None,
             min_phase_samples=mm_cfg.min_phase_samples,
         )
+        gt_micro_runs = labels_to_runs(
+            gt_micro_labels,
+            positive_labels=(CONCENTRIC_LABEL, ECCENTRIC_LABEL),
+            min_length=mm_cfg.min_phase_samples,
+        )
+        gt_macro_runs = labels_to_runs(
+            gt_macro_labels,
+            positive_labels=[label for label in macro_classes if label != OTHER_LABEL],
+            min_length=mm_cfg.min_phase_samples,
+        )
+        pred_macro_runs = _macro_runs_from_probs(macro_probs, macro_classes, min_length=mm_cfg.min_phase_samples)
         metrics = rep_metrics(pred_reps, truth_reps, sample_rate_hz=sample_rate)
-        metric_rows.append({"stream_id": stream_id, "micro_source": micro_source, "sample_rate_hz": sample_rate, **metrics})
+        micro_sample = sample_classification_metrics(gt_micro_labels, pred_micro_labels, MICRO_LABELS)
+        macro_sample = sample_classification_metrics(gt_macro_labels, pred_macro_labels, macro_classes)
+        micro_iou = segment_iou_f1(gt_micro_runs, pred_micro_runs)
+        macro_iou = segment_iou_f1(gt_macro_runs, pred_macro_runs)
+        metric_rows.append({
+            "stream_id": stream_id,
+            "micro_source": micro_source,
+            "sample_rate_hz": sample_rate,
+            **metrics,
+            "micro_sample_accuracy": micro_sample["accuracy"],
+            "micro_sample_macro_f1": micro_sample["macro_f1"],
+            "macro_sample_accuracy": macro_sample["accuracy"],
+            "macro_sample_macro_f1": macro_sample["macro_f1"],
+            "micro_edit": edit_score(gt_micro_runs, pred_micro_runs),
+            "macro_edit": edit_score(gt_macro_runs, pred_macro_runs),
+            "micro_f1_at_10": micro_iou["f1_at_10"],
+            "micro_f1_at_25": micro_iou["f1_at_25"],
+            "micro_f1_at_50": micro_iou["f1_at_50"],
+            "macro_f1_at_10": macro_iou["f1_at_10"],
+            "macro_f1_at_25": macro_iou["f1_at_25"],
+            "macro_f1_at_50": macro_iou["f1_at_50"],
+        })
         pred_rows.extend(reps_to_rows(stream_id, pred_reps))
         diag_rows.extend(diagnostics_to_rows(stream_id, diagnostics))
 
@@ -392,11 +513,29 @@ def _evaluate_streams(
             pred_actions.append(pred_reps[pi].pred_action_type)
 
         if plot_count < int(mm_cfg.plot_max_streams):
-            gt_micro = micro_labels_from_phase(df["phase"].to_numpy())
-            gt_runs = labels_to_runs(gt_micro, positive_labels=(CONCENTRIC_LABEL, ECCENTRIC_LABEL), min_length=mm_cfg.min_phase_samples)
-            macro_runs = _macro_runs_from_probs(macro_probs, macro_classes, min_length=mm_cfg.min_phase_samples)
-            plot_path = output_dir / "plots" / micro_source / (stream_id.replace("/", "_") + ".svg")
-            write_micro_macro_svg(plot_path, stream_id, df, gt_runs, pred_micro_runs, truth_reps, pred_reps, macro_runs, sample_rate)
+            plot_name = stream_id.replace("/", "_") + ".svg"
+            rep_plot_path = output_dir / "plots" / "rep" / micro_source / plot_name
+            action_plot_path = output_dir / "plots" / "action" / micro_source / plot_name
+            write_micro_macro_svg(
+                rep_plot_path,
+                stream_id,
+                df,
+                gt_micro_runs,
+                pred_micro_runs,
+                truth_reps,
+                pred_reps,
+                pred_macro_runs,
+                sample_rate,
+            )
+            write_action_prediction_svg(
+                action_plot_path,
+                stream_id,
+                df,
+                gt_macro_runs,
+                pred_macro_runs,
+                pred_reps,
+                sample_rate,
+            )
             plot_count += 1
 
     pred_df = pd.DataFrame(pred_rows)
@@ -425,7 +564,122 @@ def _evaluate_streams(
             "transition_mae_ms": float(metrics_df["transition_mae_ms"].dropna().mean()) if "transition_mae_ms" in metrics_df else float("nan"),
             "rep_action_accuracy": float(action_summary["accuracy"]),
         })
+        for key in (
+            "micro_sample_accuracy",
+            "micro_sample_macro_f1",
+            "macro_sample_accuracy",
+            "macro_sample_macro_f1",
+            "micro_edit",
+            "macro_edit",
+            "micro_f1_at_10",
+            "micro_f1_at_25",
+            "micro_f1_at_50",
+            "macro_f1_at_10",
+            "macro_f1_at_25",
+            "macro_f1_at_50",
+        ):
+            if key in metrics_df:
+                overall[key] = float(metrics_df[key].dropna().mean())
     return {"overall": overall, "plot_count": plot_count}
+
+
+def _fmt_metric(value: object) -> str:
+    if isinstance(value, float):
+        if np.isnan(value):
+            return "nan"
+        return f"{value:.4f}"
+    return str(value)
+
+
+def _write_report_md(
+    output_dir: Path,
+    summary: Dict[str, object],
+    config_path: Path,
+    train_cfg: TrainConfig,
+    mm_cfg: MicroMacroConfig,
+    dtw_cfg: DTWMicroConfig,
+) -> None:
+    overall = dict(summary.get("overall", {}) or {})
+    primary_keys = [
+        "precision",
+        "recall",
+        "f1",
+        "start_mae_ms",
+        "end_mae_ms",
+        "transition_mae_ms",
+        "rep_action_accuracy",
+        "micro_sample_macro_f1",
+        "micro_f1_at_10",
+        "micro_f1_at_25",
+        "micro_f1_at_50",
+        "macro_sample_macro_f1",
+        "macro_f1_at_10",
+        "macro_f1_at_25",
+        "macro_f1_at_50",
+        "micro_edit",
+        "macro_edit",
+    ]
+    metric_rows = ["| Metric | Value |", "|---|---:|"]
+    for key in primary_keys:
+        if key in overall:
+            metric_rows.append(f"| `{key}` | {_fmt_metric(overall[key])} |")
+
+    artifact_rows = [
+        "| Artifact | Path |",
+        "|---|---|",
+        f"| Summary JSON | `{(output_dir / 'metrics' / 'summary.json').as_posix()}` |",
+        f"| Stream metrics | `{(output_dir / 'metrics' / ('stream_metrics_' + str(summary.get('micro_source')) + '.csv')).as_posix()}` |",
+        f"| Rep detections | `{(output_dir / 'detections' / ('rep_detections_' + str(summary.get('micro_source')) + '.csv')).as_posix()}` |",
+        f"| Pairing diagnostics | `{(output_dir / 'detections' / ('pairing_diagnostics_' + str(summary.get('micro_source')) + '.csv')).as_posix()}` |",
+        f"| Rep plots | `{(output_dir / 'plots' / 'rep' / str(summary.get('micro_source'))).as_posix()}` |",
+        f"| Action plots | `{(output_dir / 'plots' / 'action' / str(summary.get('micro_source'))).as_posix()}` |",
+        f"| Model checkpoint | `{(output_dir / 'models' / 'ds_ms_tcn.pt').as_posix()}` |",
+    ]
+
+    config_rows = [
+        "| Setting | Value |",
+        "|---|---|",
+        f"| Config | `{config_path.as_posix()}` |",
+        f"| Micro source | `{summary.get('micro_source')}` |",
+        f"| Modes | `{summary.get('modes')}` |",
+        f"| Train subjects | `{summary.get('verified_train_split_subjects')}` |",
+        f"| Test subjects | `{summary.get('verified_test_split_subjects')}` |",
+        f"| Device | `{train_cfg.device}` |",
+        f"| Batch size | `{train_cfg.batch_size}` |",
+        f"| Epochs | `{train_cfg.epochs}` |",
+        f"| Slice seconds | `{mm_cfg.slice_seconds}` |",
+        f"| Overlap | `{mm_cfg.overlap}` |",
+        f"| TCN filters/layers | `{mm_cfg.num_filters}/{mm_cfg.num_layers}` |",
+        f"| Causal convolution | `{mm_cfg.causal}` |",
+        f"| DTW stride/duration/downsample/max windows | `{dtw_cfg.detection_stride}/{dtw_cfg.duration_stride or dtw_cfg.detection_stride}/{dtw_cfg.dtw_downsample_factor}/{dtw_cfg.max_windows_per_label}` |",
+    ]
+
+    text = "\n".join(
+        [
+            f"# Micro/Macro Recognition Report ({summary.get('micro_source')})",
+            "",
+            "## Key Metrics",
+            "",
+            "\n".join(metric_rows),
+            "",
+            "## Experiment",
+            "",
+            "\n".join(config_rows),
+            "",
+            "## Artifacts",
+            "",
+            "\n".join(artifact_rows),
+            "",
+            "## Notes",
+            "",
+            "- Rep segmentation `f1` uses IoU >= 0.50 matching at rep level.",
+            "- Micro/macro `f1_at_10/25/50` are segment IoU-F1 metrics.",
+            "- Action plots are separated from rep segmentation plots so the color-coded action prediction is easier to inspect.",
+            "- Run `python -m evaluation.streaming_micro_macro` on a trained TCN run to generate online replay CSV/SVG/HTML outputs.",
+            "",
+        ]
+    )
+    (output_dir / "report.md").write_text(text, encoding="utf-8")
 
 
 def run(
@@ -435,8 +689,11 @@ def run(
     no_timestamp: bool,
     dry_run: bool,
     _run_stamp: str | None = None,
+    output_dir_override: Path | None = None,
 ) -> None:
     raw = _load_config(config_path)
+    if output_dir_override is not None:
+        raw.setdefault("io", {})["micro_macro_output_dir"] = str(output_dir_override)
     feature_cfg = raw.get("feature", {}) or {}
     train_cfg = TrainConfig(**(raw.get("train", {}) or {}))
     mm_raw = dict(raw.get("micro_macro", {}) or {})
@@ -446,13 +703,17 @@ def run(
     if resolved_micro_source == "both":
         stamp = _run_stamp or ("latest" if no_timestamp else datetime.now().strftime("%Y%m%d_%H%M%S"))
         for source in ("tcn", "dtw"):
-            run(config_path, source, mode, no_timestamp, dry_run, _run_stamp=stamp)
+            run(config_path, source, mode, no_timestamp, dry_run, _run_stamp=stamp, output_dir_override=output_dir_override)
         return
     if resolved_micro_source not in {"tcn", "dtw"}:
         raise ValueError(f"Unsupported micro_source: {resolved_micro_source}")
     mm_cfg = MicroMacroConfig(**mm_raw)
     dtw_cfg = DTWMicroConfig(**dtw_raw)
     set_seed(int(train_cfg.seed))
+    device = _resolve_device(train_cfg.device)
+    train_cfg.device = str(device)
+    resolved_num_workers = _resolve_num_workers(train_cfg.num_workers, device)
+    resolved_pin_memory = _resolve_pin_memory(train_cfg.pin_memory, device)
 
     modes = list(mm_cfg.train_on_modes)
     if mode != "both":
@@ -471,14 +732,27 @@ def run(
         (output_dir / sub).mkdir(parents=True, exist_ok=True)
 
     subjects_sorted = sorted(set(subjects))
-    test_subject = subjects_sorted[-1]
+    test_subject = str(train_cfg.test_subject) if train_cfg.test_subject else subjects_sorted[-1]
+    if test_subject not in subjects_sorted:
+        raise ValueError(f"Configured test_subject={test_subject!r} not found in subjects: {subjects_sorted}")
     train_subjects = [s for s in subjects_sorted if s != test_subject]
     train_streams = _filter_subjects(streams, train_subjects, subject_column)
     test_streams = _filter_subjects(streams, [test_subject], subject_column)
     train_sequences = [df for _, df in train_streams]
     test_sequences = [df for _, df in test_streams]
+    train_split_subjects = {str(df.iloc[0]["_split_subject"]) for _, df in train_streams if "_split_subject" in df.columns and len(df)}
+    test_split_subjects = {str(df.iloc[0]["_split_subject"]) for _, df in test_streams if "_split_subject" in df.columns and len(df)}
+    overlap_subjects = sorted(train_split_subjects & test_split_subjects)
+    if overlap_subjects:
+        raise RuntimeError(f"Subject-wise split leakage detected: {overlap_subjects}")
     print(f"[INFO] micro_source={resolved_micro_source} modes={modes} train_subjects={train_subjects} test_subject={test_subject}")
     print(f"[INFO] streams train={len(train_streams)} test={len(test_streams)} actions={macro_classes}")
+    print(f"[INFO] subject-wise split verified: train={sorted(train_split_subjects)} test={sorted(test_split_subjects)}")
+    print(
+        "[INFO] resources "
+        f"device={device} amp={bool(train_cfg.amp) and device.type == 'cuda'} "
+        f"num_workers={resolved_num_workers} pin_memory={resolved_pin_memory}"
+    )
 
     stats = compute_train_stats(train_sequences, imu_columns)
     stats.save(output_dir / "metadata" / "zscore_stats.json")
@@ -486,9 +760,23 @@ def run(
     test_streams = [(sid, apply_zscore(df, imu_columns, stats)) for sid, df in test_streams]
     train_sequences = [df for _, df in train_streams]
 
-    sample_rate = int((raw.get("window", {}) or {}).get("sample_rate_hz", 50))
+    fallback_sample_rate = float((raw.get("window", {}) or {}).get("sample_rate_hz", 50))
+    sample_rate = _median_sample_rate(train_streams, fallback_sample_rate)
     slice_len = max(8, int(round(float(mm_cfg.slice_seconds) * sample_rate)))
     stride_len = max(1, int(round(slice_len * (1.0 - float(mm_cfg.overlap)))))
+    single_rf = 1 + (int(mm_cfg.kernel_size) - 1) * sum(2 ** i for i in range(int(mm_cfg.num_layers)))
+    total_rf = 1 + 4 * (single_rf - 1)
+    if bool(mm_cfg.causal) and slice_len < total_rf:
+        print(
+            f"[WARN] slice_len={slice_len} is shorter than estimated causal total RF={total_rf}; "
+            "increase slice_seconds or reduce num_layers for full context.",
+            flush=True,
+        )
+    print(
+        f"[INFO] train sample_rate_hz={sample_rate:.3f} slice_len={slice_len} "
+        f"stride_len={stride_len} single_stage_rf={single_rf} total_causal_rf={total_rf}",
+        flush=True,
+    )
     use_gt_micro_probs = resolved_micro_source == "dtw"
     ds = SequenceSliceDataset(
         train_sequences,
@@ -501,7 +789,15 @@ def run(
     if dry_run:
         print(f"[DRY RUN] slices={len(ds)} slice_len={slice_len} stride_len={stride_len}")
         return
-    loader = DataLoader(ds, batch_size=int(train_cfg.batch_size), shuffle=True, num_workers=int(train_cfg.num_workers))
+    loader_kwargs = {
+        "batch_size": int(train_cfg.batch_size),
+        "shuffle": True,
+        "num_workers": resolved_num_workers,
+        "pin_memory": resolved_pin_memory,
+    }
+    if resolved_num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+    loader = DataLoader(ds, **loader_kwargs)
     model = DSMSTCN(
         DSMSTCNConfig(
             input_channels=len(imu_columns),
@@ -511,6 +807,7 @@ def run(
             num_layers=int(mm_cfg.num_layers),
             kernel_size=int(mm_cfg.kernel_size),
             dropout=float(mm_cfg.dropout),
+            causal=bool(mm_cfg.causal),
         )
     )
     _train_model(model, loader, train_cfg, mm_cfg, use_gt_micro_probs=use_gt_micro_probs)
@@ -535,21 +832,46 @@ def run(
         mm_cfg=mm_cfg,
         dtw_cfg=dtw_cfg,
         output_dir=output_dir,
-        device=torch.device(train_cfg.device),
+        device=device,
     )
     summary.update(
         {
             "micro_source": resolved_micro_source,
+            "task": "micro_macro_recognition",
+            "model_name": f"ds_ms_tcn_{resolved_micro_source}",
             "configured_micro_source": configured_micro_source,
             "resolved_micro_source": resolved_micro_source,
             "modes": modes,
             "train_subjects": train_subjects,
             "test_subject": test_subject,
+            "verified_train_split_subjects": sorted(train_split_subjects),
+            "verified_test_split_subjects": sorted(test_split_subjects),
+            "subject_split_overlap": overlap_subjects,
             "macro_classes": macro_classes,
             "micro_classes": list(MICRO_LABELS),
+            "sample_rate_hz_for_training_slices": sample_rate,
+            "slice_len_samples": slice_len,
+            "stride_len_samples": stride_len,
+            "primary_metrics": primary_metric_table(summary.get("overall", {}) or {}),
         }
     )
     (output_dir / "metrics" / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    write_run_manifest(
+        output_dir,
+        task="micro_macro_recognition",
+        model_name=f"ds_ms_tcn_{resolved_micro_source}",
+        config_path=config_path,
+        extras={
+            "micro_source": resolved_micro_source,
+            "modes": modes,
+            "train_subjects": train_subjects,
+            "test_subject": test_subject,
+            "sample_rate_hz_for_training_slices": sample_rate,
+            "slice_len_samples": slice_len,
+            "stride_len_samples": stride_len,
+        },
+    )
+    _write_report_md(output_dir, summary, config_path, train_cfg, mm_cfg, dtw_cfg)
     shutil.copy2(config_path, output_dir / "metadata" / "config_snapshot.yaml")
     print(json.dumps(summary["overall"], indent=2))
     print(f"[OK] Wrote outputs to {output_dir}")
@@ -562,12 +884,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=["sets", "whole", "both"], default="both")
     parser.add_argument("--no-timestamp", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--output-dir", type=Path, default=None, help="Override io.micro_macro_output_dir")
+    parser.add_argument("--run-stamp", default=None, help="Run folder name under the output directory")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    run(args.config, args.micro_source, args.mode, args.no_timestamp, args.dry_run)
+    run(
+        args.config,
+        args.micro_source,
+        args.mode,
+        args.no_timestamp,
+        args.dry_run,
+        _run_stamp=args.run_stamp,
+        output_dir_override=args.output_dir,
+    )
 
 
 if __name__ == "__main__":

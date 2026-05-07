@@ -47,7 +47,12 @@ Use `data.include_actions` in `config.yaml` to control which action folders are 
 - `train/hybrid_rep_segmentation.py`: hybrid SDTW + AutoGluon classifier rep segmentation
 - `preprocessing/sdtw_rep_segmentation.py`: SDTW-based repetition segmentation utilities
 - `preprocessing/hybrid_rep_features.py`: per-candidate features for the hybrid classifier
+- `evaluation/reporting.py`: shared run manifests, summaries, and Markdown reports
+- `evaluation/compare_runs.py`: collect run summaries into one comparison table
+- `evaluation/model_suite.py`: run selected comparable models into one suite
+  folder and write shared comparison CSV/Markdown reports
 - `evaluation/rep_segmentation.py`: rep segmentation evaluation and SVG plot generation
+- `evaluation/streaming_micro_macro.py`: offline replay of causal online predictions
 - `configs/`: task-scoped config copies for experiments
 - `scripts/plot_phase_segments.py`: phase segmentation plot helper
 - `scripts/plot_rep_phase_prediction.py`: one-rep phase prediction plot helper
@@ -55,6 +60,48 @@ Use `data.include_actions` in `config.yaml` to control which action folders are 
 - `deploy/luckfox_infer.py`: ONNX runtime sliding-window inference helper
 
 Generated outputs are kept under `artifacts/` and are ignored by git.
+
+## Standard Run Outputs
+
+Training and evaluation entrypoints keep their original artifacts, but now also
+write a common comparison layer whenever possible:
+
+- `report.md`: human-readable run report with key metrics and artifact links.
+- `metrics/summary.json`: standardized summary with `overall` and
+  `primary_metrics`.
+- `metadata/run_manifest.json`: task, model name, config path, split details,
+  and run metadata.
+- `metadata/config_snapshot.yaml`: config copied at run time.
+
+This keeps model-specific details intact while making different models easier
+to compare.
+
+Create a cross-run comparison table:
+
+```bash
+python -m evaluation.compare_runs --root artifacts --output artifacts/run_comparison.csv
+```
+
+The resulting CSV and Markdown report normalize common fields such as
+`accuracy`, `macro_f1`, `precision`, `recall`, `f1`, and `iou_f1_50` across
+action, phase, rep, and micro/macro runs.
+
+Run comparable rep/action models from one command:
+
+```bash
+python -m evaluation.model_suite --models ds_ms_tcn --mode sets
+```
+
+Useful model choices:
+
+- `ds_ms_tcn`: runs `ds_ms_tcn_tcn` and `ds_ms_tcn_dtw`.
+- `sdtw`: runs the plain SDTW rep segmentation baseline.
+- `hybrid`: runs SDTW candidates plus the AutoGluon classifier/refiner.
+- `all`: runs DS-MS-TCN TCN, DS-MS-TCN DTW, SDTW, and hybrid.
+
+Outputs are grouped under `artifacts/model_suites/<run_id>/`, with each model's
+own artifacts kept separate and shared `comparison.csv` and `comparison.md`
+files at the suite root.
 
 ## Python Version
 
@@ -135,6 +182,8 @@ python -m train.action_classification --config configs/action_classification.yam
 - `train_soft_labels.csv` — teacher probability outputs (for distillation)
 - `test_soft_labels.csv`
 - `autogluon_summary.json`
+- `report.md`, `metrics/summary.json`, `metadata/run_manifest.json` —
+  standardized comparison outputs
 
 ## Knowledge Distillation (Tabular Teacher → Student)
 
@@ -318,16 +367,97 @@ micro_macro:
 The CLI flag is only an override for quick comparisons; the fixed phase order
 `concentric -> eccentric` is intentionally not configurable.
 
+Resource settings are automatic by default:
+
+```yaml
+train:
+  device: auto       # CUDA -> MPS -> CPU
+  num_workers: auto
+  pin_memory: auto   # enabled only for CUDA
+  amp: true          # mixed precision only on CUDA
+```
+
+Set `device: cpu`, `device: cuda`, or `device: mps` if you want to force a
+specific backend. The run prints the resolved device, AMP state, DataLoader
+workers, and pinned-memory setting before training starts.
+
+The split is subject-wise: streams are assigned by their subject folder, and the
+run aborts if any split subject appears in both train and test. Set the held-out
+person with:
+
+```yaml
+train:
+  test_subject: kevin
+```
+
+The paper uses non-causal temporal convolutions, which can look at future
+samples. This pipeline defaults to causal convolutions for real-time use:
+
+```yaml
+micro_macro:
+  causal: true
+```
+
+Set `causal: false` to run the paper-style symmetric/non-causal TCN for offline
+comparison.
+
+Training slices are sized from the actual training-stream sample rate, so
+`slice_seconds: 40.0` remains 40 seconds even when the raw data is not exactly
+the fallback `window.sample_rate_hz`.
+
+After training a causal TCN run, generate a streaming-style online replay with:
+
+```bash
+python -m evaluation.streaming_micro_macro \
+  --run-dir artifacts/micro_macro_recognition/<timestamp>/tcn \
+  --csv datasets/raw_data/<subject>/<action>/<set>/your.csv
+```
+
+This feeds one sample at a time through a rolling buffer and writes a
+sample-by-sample CSV, a static SVG overview, and an interactive HTML replay.
+The HTML replay shows a moving cursor and changing online micro/action labels;
+it is an offline replay of online inference, not a live sensor UI.
+
+The DTW Stage 1 comparison is CPU-bound, so long whole-session streams can be
+slow. The config uses a coarse search by default:
+
+```yaml
+micro_macro:
+  dtw:
+    detection_stride: 8
+    duration_stride: 8
+    dtw_downsample_factor: 2
+    max_windows_per_label: 5000
+```
+
+Lower these values for a denser but slower DTW search.
+
 Artifacts are written under `./artifacts/micro_macro_recognition/`:
 
+- `report.md`: one-page experiment report with key metrics, split details,
+  config highlights, and artifact links.
 - `models/ds_ms_tcn.pt`: trained four-stage model.
 - `detections/rep_detections_{tcn,dtw}.csv`: predicted reps with transition,
   micro confidence, and predicted action label.
 - `detections/pairing_diagnostics_{tcn,dtw}.csv`: invalid or unpaired micro
   runs such as missing eccentric segments.
 - `metrics/stream_metrics_{tcn,dtw}.csv`: rep-level segmentation metrics.
+  This also includes paper-style temporal segmentation metrics for both micro
+  and macro streams: sample accuracy, sample macro-F1, edit score, and
+  segment IoU F1@10/25/50.
 - `metrics/rep_action_confusion_{tcn,dtw}.csv`: per-rep action confusion matrix.
-- `plots/{tcn,dtw}/*.svg`: waveform overlays for visual debugging.
+- `plots/rep/{tcn,dtw}/*.svg`: waveform overlays for rep segmentation
+  debugging.
+- `plots/action/{tcn,dtw}/*.svg`: separate color-coded GT/pred action plots
+  with predicted rep action labels.
+
+Streaming replay artifacts are written by `evaluation.streaming_micro_macro`
+under `<run-dir>/streaming_eval/<stream_id>/`:
+
+- `streaming_predictions.csv`: sample-by-sample online labels and confidences.
+- `streaming_replay.svg`: color-block overview with synchronized IMU waveforms.
+- `streaming_replay.html`: interactive replay with a moving time cursor.
+- `streaming_summary.json`: input/output paths and buffer information.
 
 ## Student Model Artifacts (`io.output_dir`)
 

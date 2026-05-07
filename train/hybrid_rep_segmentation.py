@@ -37,6 +37,7 @@ from typing import Dict, List, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
+from evaluation.reporting import primary_metric_table, write_report
 from evaluation.rep_segmentation import (
     _aggregate_metrics,
     _detection_rows,
@@ -767,6 +768,8 @@ def evaluate_hybrid(
     labeled_df.to_csv(candidates_dir / "labeled_candidates.csv", index=False)
 
     summary: Dict[str, object] = {
+        "task": "rep_segmentation",
+        "model_name": "sdtw_autogluon_hybrid",
         "mode": mode,
         "iou_threshold": iou_threshold,
         "hybrid": asdict(hybrid_cfg),
@@ -788,6 +791,7 @@ def evaluate_hybrid(
             summary["by_action"][str(action)] = _aggregate_metrics(group.to_dict("records"))
         for subject, group in metrics_df.groupby("test_subject"):
             summary["by_subject"][str(subject)] = _aggregate_metrics(group.to_dict("records"))
+    summary["primary_metrics"] = primary_metric_table(summary["overall"])
 
     (dirs["metrics"] / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     (dirs["metadata"] / "run_manifest.json").write_text(
@@ -831,6 +835,30 @@ def evaluate_hybrid(
             ]
         ),
         encoding="utf-8",
+    )
+    write_report(
+        dirs["root"],
+        title=f"Hybrid Rep Segmentation Report ({mode})",
+        task="rep_segmentation",
+        model_name="sdtw_autogluon_hybrid",
+        overall=summary["overall"],
+        artifacts={
+            "Summary JSON": (dirs["metrics"] / "summary.json").as_posix(),
+            "Stream metrics": (dirs["metrics"] / "stream_metrics.csv").as_posix(),
+            "Detections": (dirs["detections"] / "detections.csv").as_posix(),
+            "Candidates": (candidates_dir / "labeled_candidates.csv").as_posix(),
+            "Templates": (dirs["templates"] / "templates.csv").as_posix(),
+            "Models": models_dir.as_posix(),
+            "Plots": dirs["plots"].as_posix() if make_plots else "disabled",
+        },
+        config={
+            "mode": mode,
+            "iou_threshold": iou_threshold,
+            "label_iou": hybrid_cfg.label_iou,
+            "subjects": subjects,
+            "actions": include_actions,
+        },
+        notes=["Standardized report added for cross-model comparison."],
     )
 
     print("\n" + "=" * 72)

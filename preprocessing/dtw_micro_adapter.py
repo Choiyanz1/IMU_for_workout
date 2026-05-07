@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Literal, Sequence, Tuple, overload
 
 import numpy as np
 import pandas as pd
@@ -26,6 +26,9 @@ class DTWMicroConfig:
     threshold_percentile: float = 75.0
     threshold_margin: float = 0.10
     detection_stride: int = 3
+    duration_stride: int = 0
+    dtw_downsample_factor: int = 1
+    max_windows_per_label: int = 0
     max_overlap_iou: float = 0.20
 
 
@@ -133,36 +136,74 @@ def fit_dtw_micro_templates(
     return templates
 
 
+@overload
 def detect_dtw_micro_runs(
     df: pd.DataFrame,
     templates: Dict[str, DTWMicroTemplate],
     imu_columns: Sequence[str],
     cfg: DTWMicroConfig | None = None,
+    return_stats: Literal[False] = False,
+) -> List[SegmentRun]: ...
+
+
+@overload
+def detect_dtw_micro_runs(
+    df: pd.DataFrame,
+    templates: Dict[str, DTWMicroTemplate],
+    imu_columns: Sequence[str],
+    cfg: DTWMicroConfig | None = None,
+    return_stats: Literal[True] = True,
+) -> Tuple[List[SegmentRun], Dict[str, int]]: ...
+
+
+def detect_dtw_micro_runs(
+    df: pd.DataFrame,
+    templates: Dict[str, DTWMicroTemplate],
+    imu_columns: Sequence[str],
+    cfg: DTWMicroConfig | None = None,
+    return_stats: bool = False,
 ) -> List[SegmentRun]:
     if cfg is None:
         cfg = DTWMicroConfig()
     if not templates:
-        return []
+        return ([], {"windows_scored": 0, "candidates": 0}) if return_stats else []
     matrix, names = _motion_matrix(df, imu_columns, cfg.smoothing_window)
     candidates: List[SegmentRun] = []
     n = len(df)
     stride = max(1, int(cfg.detection_stride))
+    duration_stride = max(1, int(cfg.duration_stride or cfg.detection_stride))
+    downsample = max(1, int(cfg.dtw_downsample_factor))
+    windows_scored = 0
     for label, template in templates.items():
         if template.signal_name not in names:
             continue
         signal = matrix[:, names.index(template.signal_name)]
-        durations = range(int(template.min_duration), int(template.max_duration) + 1, stride)
-        for start in range(0, max(0, n - template.min_duration + 1), stride):
+        query = template.query[::downsample] if downsample > 1 else template.query
+        durations = list(range(int(template.min_duration), int(template.max_duration) + 1, duration_stride))
+        starts = list(range(0, max(0, n - template.min_duration + 1), stride))
+        max_windows = int(cfg.max_windows_per_label)
+        if max_windows > 0 and len(starts) * max(1, len(durations)) > max_windows:
+            keep_starts = max(1, max_windows // max(1, len(durations)))
+            idx = np.linspace(0, len(starts) - 1, num=min(keep_starts, len(starts)), dtype=int)
+            starts = [starts[int(i)] for i in np.unique(idx)]
+        for start in starts:
             for duration in durations:
                 end = start + duration
                 if end > n:
                     break
-                cost, _ = dtw_path_cost(template.query, signal[start:end])
+                windows_scored += 1
+                window = signal[start:end]
+                if downsample > 1:
+                    window = window[::downsample]
+                cost, _ = dtw_path_cost(query, window)
                 if not np.isfinite(cost) or cost > template.cost_threshold:
                     continue
                 confidence = max(1e-4, 1.0 - float(cost) / max(template.cost_threshold, 1e-8))
                 candidates.append(SegmentRun(label=label, start_idx=start, end_idx=end, confidence=confidence))
-    return _nms(candidates, cfg.max_overlap_iou)
+    kept = _nms(candidates, cfg.max_overlap_iou)
+    if return_stats:
+        return kept, {"windows_scored": windows_scored, "candidates": len(candidates), "kept": len(kept)}
+    return kept
 
 
 def dtw_runs_to_micro_scores(

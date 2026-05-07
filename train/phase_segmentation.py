@@ -36,6 +36,7 @@ from datasets.custom_resistance_dataset import (
     filter_sequences_by_subject,
     prepare_sequences_from_folder,
 )
+from evaluation.reporting import write_standard_run_outputs
 from preprocessing.window_pipeline import (
     set_seed,
 )
@@ -741,6 +742,40 @@ def train_phase(config_path: Path, dry_run: bool = False, use_timestamp: bool = 
         "best_model": predictor.model_best,
     }
     (output_dir / "phase_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    standard_overall = dict(overall)
+    standard_overall.update(
+        {
+            "transition_mae_ms": transition_summary.get("transition_mae_ms", float("nan")),
+            "transition_median_abs_error_ms": transition_summary.get("transition_median_abs_error_ms", float("nan")),
+        }
+    )
+    write_standard_run_outputs(
+        output_dir,
+        task="phase_segmentation",
+        model_name=f"autogluon_{predictor.model_best}",
+        title="Phase Segmentation Report",
+        overall=standard_overall,
+        details={"legacy_summary": summary},
+        artifacts={
+            "Legacy summary": (output_dir / "phase_summary.json").as_posix(),
+            "Leaderboard": (output_dir / "leaderboard.csv").as_posix(),
+            "Confusion matrix": (output_dir / "confusion_matrix.csv").as_posix(),
+            "Classification report": (output_dir / "classification_report.json").as_posix(),
+            "Rep transition metrics": (output_dir / "rep_transition_metrics.csv").as_posix(),
+            "Models": (output_dir / "models").as_posix(),
+        },
+        config={
+            "feature_mode": phase_cfg.feature_mode,
+            "window_seconds": phase_cfg.window_seconds,
+            "stride_seconds": phase_cfg.stride_seconds,
+            "train_subjects": train_subj,
+            "test_subjects": test_subj,
+        },
+        config_path=config_path,
+        notes=[
+            "Standardized report added for cross-model comparison; original phase artifacts are unchanged.",
+        ],
+    )
 
     print(f"\nbest_model: {summary['best_model']}")
     print(f"test accuracy: {overall['accuracy']:.4f}")

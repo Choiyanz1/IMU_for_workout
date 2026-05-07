@@ -276,6 +276,93 @@ def rep_metrics(
     }
 
 
+def sample_classification_metrics(
+    y_true: Sequence[object],
+    y_pred: Sequence[object],
+    labels: Sequence[str],
+) -> Dict[str, float]:
+    """Return sample-wise accuracy plus macro-F1 without requiring sklearn."""
+    true_values = [str(x) for x in y_true]
+    pred_values = [str(x) for x in y_pred]
+    label_values = [str(x) for x in labels]
+    n = min(len(true_values), len(pred_values))
+    if n == 0:
+        return {"accuracy": float("nan"), "macro_f1": float("nan")}
+    true_values = true_values[:n]
+    pred_values = pred_values[:n]
+    accuracy = sum(t == p for t, p in zip(true_values, pred_values)) / float(n)
+    f1s = []
+    for label in label_values:
+        tp = sum(t == label and p == label for t, p in zip(true_values, pred_values))
+        fp = sum(t != label and p == label for t, p in zip(true_values, pred_values))
+        fn = sum(t == label and p != label for t, p in zip(true_values, pred_values))
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        recall = tp / (tp + fn) if tp + fn else 0.0
+        f1s.append(2 * precision * recall / (precision + recall) if precision + recall else 0.0)
+    return {"accuracy": float(accuracy), "macro_f1": float(np.mean(f1s) if f1s else float("nan"))}
+
+
+def segment_iou_f1(
+    true_runs: Sequence[SegmentRun],
+    pred_runs: Sequence[SegmentRun],
+    iou_thresholds: Sequence[float] = (0.10, 0.25, 0.50),
+) -> Dict[str, float]:
+    """Segment-level IoU F1@k for temporal segmentation labels.
+
+    A prediction can match a truth segment only when both label and IoU pass the
+    threshold. Matching is greedy by IoU, matching the common MS-TCN evaluation.
+    """
+    out: Dict[str, float] = {}
+    pairs = []
+    for pi, pred in enumerate(pred_runs):
+        for ti, true in enumerate(true_runs):
+            if pred.label != true.label:
+                continue
+            iou = segment_iou((pred.start_idx, pred.end_idx), (true.start_idx, true.end_idx))
+            pairs.append((pi, ti, iou))
+    for threshold in iou_thresholds:
+        used_p, used_t = set(), set()
+        tp = 0
+        for pi, ti, iou in sorted(pairs, key=lambda x: x[2], reverse=True):
+            if iou < threshold or pi in used_p or ti in used_t:
+                continue
+            used_p.add(pi)
+            used_t.add(ti)
+            tp += 1
+        fp = max(0, len(pred_runs) - tp)
+        fn = max(0, len(true_runs) - tp)
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        recall = tp / (tp + fn) if tp + fn else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        out[f"f1_at_{int(round(threshold * 100)):02d}"] = float(f1)
+    return out
+
+
+def edit_score(true_runs: Sequence[SegmentRun], pred_runs: Sequence[SegmentRun]) -> float:
+    """Normalized segmental edit score after collapsing repeated labels."""
+    true_labels = [run.label for run in true_runs]
+    pred_labels = [run.label for run in pred_runs]
+    if not true_labels and not pred_labels:
+        return 100.0
+    if not true_labels or not pred_labels:
+        return 0.0
+    rows = len(true_labels) + 1
+    cols = len(pred_labels) + 1
+    dp = np.zeros((rows, cols), dtype=np.int32)
+    dp[:, 0] = np.arange(rows)
+    dp[0, :] = np.arange(cols)
+    for i in range(1, rows):
+        for j in range(1, cols):
+            cost = 0 if true_labels[i - 1] == pred_labels[j - 1] else 1
+            dp[i, j] = min(
+                dp[i - 1, j] + 1,
+                dp[i, j - 1] + 1,
+                dp[i - 1, j - 1] + cost,
+            )
+    distance = int(dp[-1, -1])
+    return float((1.0 - distance / max(len(true_labels), len(pred_labels))) * 100.0)
+
+
 def truth_reps_from_labels(
     phases: Sequence[object],
     actions: Sequence[object] | None = None,
@@ -325,18 +412,44 @@ def _polyline(values: np.ndarray, x0: float, y0: float, width: float, height: fl
     return " ".join(f"{x:.1f},{y:.1f}" for x, y in zip(xs, ys))
 
 
-def _rects(segments: Sequence[Tuple[int, int, str]], n: int, x0: float, width: float, y: float, h: float) -> str:
+def _label_color(label: str) -> str:
     colors = {
         CONCENTRIC_LABEL: "#22c55e",
         ECCENTRIC_LABEL: "#f97316",
         OTHER_LABEL: "#94a3b8",
+        "uncertain": "#64748b",
     }
+    palette = (
+        "#2563eb",
+        "#dc2626",
+        "#7c3aed",
+        "#0891b2",
+        "#ca8a04",
+        "#db2777",
+        "#16a34a",
+        "#9333ea",
+    )
+    if label in colors:
+        return colors[label]
+    idx = sum(ord(ch) for ch in str(label)) % len(palette)
+    return palette[idx]
+
+
+def _rects(
+    segments: Sequence[Tuple[int, int, str]],
+    n: int,
+    x0: float,
+    width: float,
+    y: float,
+    h: float,
+    opacity: float = 0.65,
+) -> str:
     parts = []
     for start, end, label in segments:
         x = x0 + start / max(1, n) * width
         w = max(1.0, (end - start) / max(1, n) * width)
-        fill = colors.get(label, "#38bdf8")
-        parts.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" height="{h:.1f}" fill="{fill}" fill-opacity="0.65"/>')
+        fill = _label_color(str(label))
+        parts.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" height="{h:.1f}" fill="{fill}" fill-opacity="{opacity:.2f}"/>')
     return "\n".join(parts)
 
 
@@ -378,15 +491,17 @@ def write_micro_macro_svg(
   <style>
     text {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #111827; }}
     .small {{ font-size: 12px; fill: #475569; }}
+    .tiny {{ font-size: 10px; fill: #111827; }}
     .label {{ font-size: 14px; font-weight: 700; }}
+    .action-label {{ paint-order: stroke; stroke: #ffffff; stroke-width: 3px; stroke-linejoin: round; }}
   </style>
   <text x="40" y="36" font-size="20" font-weight="700">{title}</text>
-  <text x="40" y="62" class="small">duration={duration_s:.1f}s, green=concentric, orange=eccentric, blue-ish=macro action</text>
+  <text x="40" y="62" class="small">duration={duration_s:.1f}s, green=concentric, orange=eccentric</text>
   <text x="40" y="109" class="label">GT micro</text>
   <rect x="{x0}" y="95" width="{plot_w}" height="18" fill="#f8fafc" stroke="#cbd5e1"/>{gt_micro}
   <text x="40" y="139" class="label">Pred micro</text>
   <rect x="{x0}" y="125" width="{plot_w}" height="18" fill="#f8fafc" stroke="#cbd5e1"/>{pred_micro}
-  <text x="40" y="174" class="label">Macro</text>
+  <text x="40" y="174" class="label">Stage 4 macro</text>
   <rect x="{x0}" y="160" width="{plot_w}" height="18" fill="#f8fafc" stroke="#cbd5e1"/>{macro_rects}
   {lines(gt_reps, "#16a34a", "5 4")}
   {lines(pred_reps, "#dc2626", "none")}
@@ -397,6 +512,162 @@ def write_micro_macro_svg(
   <rect x="{x0}" y="480" width="{plot_w}" height="170" fill="#f8fafc" stroke="#cbd5e1"/>
   <polyline points="{gyro_pts}" fill="none" stroke="#7c3aed" stroke-width="1.4"/>
   <text x="{x0}" y="710" class="small">GT rep lines dashed green; predicted rep lines red; thicker middle line is phase transition.</text>
+</svg>
+"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(svg, encoding="utf-8")
+
+
+def write_action_prediction_svg(
+    path: Path,
+    stream_id: str,
+    df: pd.DataFrame,
+    gt_macro_runs: Sequence[SegmentRun],
+    pred_macro_runs: Sequence[SegmentRun],
+    pred_reps: Sequence[RepDetection],
+    sample_rate_hz: float,
+) -> None:
+    width, height = 1280, 560
+    x0, plot_w = 110, 1080
+    n = len(df)
+    acc = _magnitude(df, ["ax", "ay", "az"])
+    gyro = _magnitude(df, ["gx", "gy", "gz"])
+    acc_pts = _polyline(acc, x0, 230, plot_w, 110)
+    gyro_pts = _polyline(gyro, x0, 370, plot_w, 110)
+    gt_rects = _rects([(r.start_idx, r.end_idx, r.label) for r in gt_macro_runs if r.label != OTHER_LABEL], n, x0, plot_w, 96, 28, opacity=0.78)
+    pred_rects = _rects([(r.start_idx, r.end_idx, r.label) for r in pred_macro_runs if r.label != OTHER_LABEL], n, x0, plot_w, 142, 28, opacity=0.78)
+
+    def rep_action_blocks(reps: Sequence[RepDetection]) -> str:
+        out = []
+        for rep in reps:
+            label = str(rep.pred_action_type)
+            if label in {"unknown", ""}:
+                continue
+            start = max(0, int(rep.start_idx))
+            end = min(n, int(rep.end_idx))
+            if end <= start:
+                continue
+            x = x0 + start / max(1, n) * plot_w
+            w = max(1.0, (end - start) / max(1, n) * plot_w)
+            mid = x + w / 2.0
+            color = _label_color(label)
+            conf = "" if not np.isfinite(rep.action_confidence) else f" {rep.action_confidence:.2f}"
+            text = html.escape(f"{label}{conf}")
+            out.append(f'<rect x="{x:.1f}" y="184" width="{w:.1f}" height="26" fill="{color}" fill-opacity="0.28" stroke="{color}" stroke-width="1"/>')
+            out.append(f'<text x="{mid:.1f}" y="202" text-anchor="middle" class="tiny action-label">{text}</text>')
+        return "\n".join(out)
+
+    labels = sorted(
+        {
+            str(r.label)
+            for r in list(gt_macro_runs) + list(pred_macro_runs)
+            if str(r.label) != OTHER_LABEL
+        }
+        | {str(r.pred_action_type) for r in pred_reps if str(r.pred_action_type) not in {"unknown", ""}}
+    )
+    legend_parts = []
+    lx, ly = x0, 522
+    for idx, label in enumerate(labels[:8]):
+        x = lx + idx * 135
+        legend_parts.append(f'<rect x="{x:.1f}" y="{ly - 11:.1f}" width="12" height="12" fill="{_label_color(label)}" fill-opacity="0.80"/>')
+        legend_parts.append(f'<text x="{x + 18:.1f}" y="{ly:.1f}" class="tiny">{html.escape(label)}</text>')
+    legend = "\n".join(legend_parts)
+
+    title = html.escape(stream_id)
+    duration_s = n / sample_rate_hz if sample_rate_hz > 0 else 0.0
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">
+  <rect width="100%" height="100%" fill="#ffffff"/>
+  <style>
+    text {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #111827; }}
+    .small {{ font-size: 12px; fill: #475569; }}
+    .tiny {{ font-size: 10px; fill: #111827; }}
+    .label {{ font-size: 14px; font-weight: 700; }}
+    .action-label {{ paint-order: stroke; stroke: #ffffff; stroke-width: 3px; stroke-linejoin: round; }}
+  </style>
+  <text x="40" y="36" font-size="20" font-weight="700">{title}</text>
+  <text x="40" y="62" class="small">duration={duration_s:.1f}s, colored bands show action type</text>
+  <text x="40" y="115" class="label">GT action</text>
+  <rect x="{x0}" y="96" width="{plot_w}" height="28" fill="#f8fafc" stroke="#cbd5e1"/>{gt_rects}
+  <text x="40" y="161" class="label">Pred action</text>
+  <rect x="{x0}" y="142" width="{plot_w}" height="28" fill="#f8fafc" stroke="#cbd5e1"/>{pred_rects}
+  <text x="40" y="202" class="label">Rep label</text>
+  <rect x="{x0}" y="184" width="{plot_w}" height="26" fill="#f8fafc" stroke="#cbd5e1"/>{rep_action_blocks(pred_reps)}
+  <text x="40" y="250" class="label">acc_mag</text>
+  <rect x="{x0}" y="230" width="{plot_w}" height="110" fill="#f8fafc" stroke="#cbd5e1"/>
+  <polyline points="{acc_pts}" fill="none" stroke="#2563eb" stroke-width="1.3"/>
+  <text x="40" y="390" class="label">gyro_mag</text>
+  <rect x="{x0}" y="370" width="{plot_w}" height="110" fill="#f8fafc" stroke="#cbd5e1"/>
+  <polyline points="{gyro_pts}" fill="none" stroke="#7c3aed" stroke-width="1.3"/>
+  {legend}
+</svg>
+"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(svg, encoding="utf-8")
+
+
+def write_streaming_prediction_svg(
+    path: Path,
+    stream_id: str,
+    df: pd.DataFrame,
+    gt_micro_runs: Sequence[SegmentRun],
+    online_micro_runs: Sequence[SegmentRun],
+    gt_macro_runs: Sequence[SegmentRun],
+    online_macro_runs: Sequence[SegmentRun],
+    sample_rate_hz: float,
+    buffer_size: int,
+) -> None:
+    width, height = 1280, 680
+    x0, plot_w = 110, 1080
+    n = len(df)
+    acc = _magnitude(df, ["ax", "ay", "az"])
+    gyro = _magnitude(df, ["gx", "gy", "gz"])
+    acc_pts = _polyline(acc, x0, 300, plot_w, 120)
+    gyro_pts = _polyline(gyro, x0, 455, plot_w, 120)
+    gt_micro = _rects([(r.start_idx, r.end_idx, r.label) for r in gt_micro_runs], n, x0, plot_w, 92, 24, opacity=0.72)
+    pred_micro = _rects([(r.start_idx, r.end_idx, r.label) for r in online_micro_runs], n, x0, plot_w, 130, 24, opacity=0.72)
+    gt_macro = _rects([(r.start_idx, r.end_idx, r.label) for r in gt_macro_runs if r.label != OTHER_LABEL], n, x0, plot_w, 185, 28, opacity=0.78)
+    pred_macro = _rects([(r.start_idx, r.end_idx, r.label) for r in online_macro_runs if r.label != OTHER_LABEL], n, x0, plot_w, 230, 28, opacity=0.78)
+
+    labels = sorted(
+        {r.label for r in list(gt_micro_runs) + list(online_micro_runs)}
+        | {r.label for r in list(gt_macro_runs) + list(online_macro_runs) if r.label != OTHER_LABEL}
+    )
+    legend_parts = []
+    lx, ly = x0, 625
+    for idx, label in enumerate(labels[:8]):
+        x = lx + idx * 135
+        legend_parts.append(f'<rect x="{x:.1f}" y="{ly - 11:.1f}" width="12" height="12" fill="{_label_color(label)}" fill-opacity="0.82"/>')
+        legend_parts.append(f'<text x="{x + 18:.1f}" y="{ly:.1f}" class="tiny">{html.escape(str(label))}</text>')
+    legend = "\n".join(legend_parts)
+
+    title = html.escape(stream_id)
+    duration_s = n / sample_rate_hz if sample_rate_hz > 0 else 0.0
+    buffer_s = buffer_size / sample_rate_hz if sample_rate_hz > 0 else 0.0
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">
+  <rect width="100%" height="100%" fill="#ffffff"/>
+  <style>
+    text {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #111827; }}
+    .small {{ font-size: 12px; fill: #475569; }}
+    .tiny {{ font-size: 10px; fill: #111827; }}
+    .label {{ font-size: 14px; font-weight: 700; }}
+  </style>
+  <text x="40" y="36" font-size="20" font-weight="700">Streaming prediction: {title}</text>
+  <text x="40" y="62" class="small">duration={duration_s:.1f}s, rolling buffer={buffer_size} samples ({buffer_s:.1f}s); predictions are emitted one sample at a time.</text>
+  <text x="40" y="110" class="label">GT micro</text>
+  <rect x="{x0}" y="92" width="{plot_w}" height="24" fill="#f8fafc" stroke="#cbd5e1"/>{gt_micro}
+  <text x="40" y="148" class="label">Online micro</text>
+  <rect x="{x0}" y="130" width="{plot_w}" height="24" fill="#f8fafc" stroke="#cbd5e1"/>{pred_micro}
+  <text x="40" y="204" class="label">GT action</text>
+  <rect x="{x0}" y="185" width="{plot_w}" height="28" fill="#f8fafc" stroke="#cbd5e1"/>{gt_macro}
+  <text x="40" y="249" class="label">Online action</text>
+  <rect x="{x0}" y="230" width="{plot_w}" height="28" fill="#f8fafc" stroke="#cbd5e1"/>{pred_macro}
+  <text x="40" y="320" class="label">acc_mag</text>
+  <rect x="{x0}" y="300" width="{plot_w}" height="120" fill="#f8fafc" stroke="#cbd5e1"/>
+  <polyline points="{acc_pts}" fill="none" stroke="#2563eb" stroke-width="1.3"/>
+  <text x="40" y="475" class="label">gyro_mag</text>
+  <rect x="{x0}" y="455" width="{plot_w}" height="120" fill="#f8fafc" stroke="#cbd5e1"/>
+  <polyline points="{gyro_pts}" fill="none" stroke="#7c3aed" stroke-width="1.3"/>
+  {legend}
 </svg>
 """
     path.parent.mkdir(parents=True, exist_ok=True)

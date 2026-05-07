@@ -22,8 +22,16 @@ train:
   epochs: 30
   lr: 0.0001
   weight_decay: 0.00001
-  num_workers: 0
-  device: cpu
+  # Held-out subject for subject-wise evaluation.
+  test_subject: kevin
+  # auto prefers CUDA, then Apple Silicon MPS, then CPU.
+  device: auto
+  # auto uses a small worker pool for GPU/MPS runs and stays conservative on CPU.
+  num_workers: auto
+  # auto enables pinned host memory only for CUDA.
+  pin_memory: auto
+  # Mixed precision is used only on CUDA; MPS/CPU keep float32.
+  amp: true
 
 micro_macro:
   # Stage 1 source. "both" runs TCN and DTW comparison runs under the same timestamp.
@@ -39,6 +47,9 @@ micro_macro:
   num_layers: 9
   kernel_size: 3
   dropout: 0.2
+  # Use causal dilated convolutions for future real-time inference.
+  # Set false to reproduce the paper-style non-causal/symmetric TCN.
+  causal: true
   alpha: 1.0
   beta: 0.15
   tmse_threshold: 4.0
@@ -52,5 +63,10 @@ micro_macro:
     duration_max_ratio: 1.75
     threshold_percentile: 75.0
     threshold_margin: 0.10
-    detection_stride: 3
+    # DTW is CPU-bound. These defaults keep the comparison usable on long
+    # whole-session streams; lower them for a slower, denser search.
+    detection_stride: 8
+    duration_stride: 8
+    dtw_downsample_factor: 2
+    max_windows_per_label: 5000
     max_overlap_iou: 0.20

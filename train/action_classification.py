@@ -20,6 +20,7 @@ from sklearn.metrics import (
 )
 
 from datasets.custom_resistance_dataset import FeatureConfig, filter_sequences_by_subject, prepare_sequences_from_folder
+from evaluation.reporting import write_standard_run_outputs
 from preprocessing.window_pipeline import (
     WindowConfig,
     apply_zscore,
@@ -508,6 +509,33 @@ def train_action_classification(config_path: Path, dry_run: bool = False, use_ti
         "model_names": predictor.model_names(),
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    write_standard_run_outputs(
+        output_dir,
+        task="action_classification",
+        model_name=f"autogluon_{predictor.model_best}",
+        title="Action Classification Report",
+        overall=overall_metrics,
+        details={"legacy_summary": summary},
+        artifacts={
+            "Legacy summary": (output_dir / "summary.json").as_posix(),
+            "Leaderboard": (output_dir / "leaderboard.csv").as_posix(),
+            "Confusion matrix": (output_dir / "confusion_matrix.csv").as_posix(),
+            "Classification report": (output_dir / "classification_report.json").as_posix(),
+            "Models": (output_dir / "models").as_posix(),
+            "Train soft labels": (output_dir / "train_soft_labels.csv").as_posix(),
+            "Test soft labels": (output_dir / "test_soft_labels.csv").as_posix(),
+        },
+        config={
+            "feature_mode": ag_cfg.feature_mode,
+            "eval_metric": ag_cfg.eval_metric,
+            "train_subjects": train_subj,
+            "test_subjects": test_subj,
+        },
+        config_path=config_path,
+        notes=[
+            "Standardized report added for cross-model comparison; original AutoGluon artifacts are unchanged.",
+        ],
+    )
 
     print(f"\nbest_model: {summary['best_model']}")
     print(f"test accuracy: {overall_metrics['accuracy']:.4f}")

@@ -52,7 +52,7 @@ from preprocessing.micro_macro_segments import (
     write_micro_macro_svg,
 )
 from preprocessing.sdtw_rep_segmentation import infer_sample_rate_hz
-from preprocessing.window_pipeline import ZScoreStats, apply_zscore, compute_train_stats, set_seed
+from preprocessing.window_pipeline import ZScoreStats, apply_zscore, compute_train_stats, resample_sequence, set_seed
 
 
 @dataclass
@@ -67,8 +67,12 @@ class MicroMacroConfig:
     alpha: float = 1.0
     beta: float = 0.15
     tmse_threshold: float = 4.0
+    num_macro_stages: int = 4
     max_phase_gap_samples: int = 0
     min_phase_samples: int = 3
+    min_rep_duration_seconds: float = 0.0
+    min_rep_confidence: float = 0.0
+    resample_to_window_rate: bool = False
     plot_max_streams: int = 24
     train_on_modes: List[str] = field(default_factory=lambda: ["sets", "whole"])
 
@@ -285,6 +289,40 @@ def _load_streams(raw_cfg: Dict, modes: Sequence[str]) -> Tuple[List[Tuple[str, 
     return streams, subjects, actions
 
 
+def _resample_streams_to_rate(
+    streams: Sequence[Tuple[str, pd.DataFrame]],
+    imu_columns: Sequence[str],
+    time_column: str,
+    target_rate_hz: int,
+) -> List[Tuple[str, pd.DataFrame]]:
+    out: List[Tuple[str, pd.DataFrame]] = []
+    for stream_id, df in streams:
+        if time_column not in df.columns or len(df) < 2:
+            copied = df.copy().reset_index(drop=True)
+            copied[time_column] = np.arange(len(copied), dtype=np.float64) / float(target_rate_hz)
+            out.append((stream_id, copied))
+            continue
+        parts: List[pd.DataFrame] = []
+        if "_source_file" in df.columns:
+            groups = [part for _, part in df.groupby("_source_file", sort=False)]
+        else:
+            groups = [df]
+        for part in groups:
+            resampled = resample_sequence(
+                part.reset_index(drop=True),
+                imu_columns=imu_columns,
+                time_column=time_column,
+                target_rate_hz=int(target_rate_hz),
+            )
+            parts.append(resampled)
+        merged = pd.concat(parts, ignore_index=True) if parts else df.copy().reset_index(drop=True)
+        # Rep CSVs are pre-segmented; make them contiguous after per-rep resampling
+        # so training uses the same fixed-rate sample clock as the board stream.
+        merged[time_column] = np.arange(len(merged), dtype=np.float64) / float(target_rate_hz)
+        out.append((stream_id, merged))
+    return out
+
+
 def _filter_subjects(streams: Sequence[Tuple[str, pd.DataFrame]], subjects: Sequence[str], subject_column: str) -> List[Tuple[str, pd.DataFrame]]:
     allowed = set(str(s) for s in subjects)
     out = []
@@ -313,9 +351,10 @@ def _predict_full_sequence(
     ext = torch.from_numpy(external_micro.astype(np.float32))[None, :, :].to(device) if external_micro is not None else None
     with torch.no_grad():
         out = model(x, external_micro_probs=ext)
+    final_macro = model.final_macro_logits(out)
     return {
         "micro_probs": out["micro_probs"].detach().cpu().numpy()[0],
-        "macro4_probs": torch.softmax(out["macro4_logits"], dim=-1).detach().cpu().numpy()[0],
+        "macro_probs": torch.softmax(final_macro, dim=-1).detach().cpu().numpy()[0],
     }
 
 
@@ -345,6 +384,25 @@ def _classification_counts(y_true: Sequence[str], y_pred: Sequence[str], labels:
         matrix.loc[true_s, pred_s] += 1
     acc = float(np.trace(matrix.to_numpy()) / max(1, matrix.to_numpy().sum()))
     return {"accuracy": acc, "confusion_matrix": matrix}
+
+
+def _filter_predicted_reps(
+    reps: Sequence,
+    sample_rate_hz: float,
+    min_duration_seconds: float,
+    min_confidence: float,
+) -> List:
+    min_samples = max(0, int(round(float(min_duration_seconds) * float(sample_rate_hz))))
+    min_conf = float(min_confidence)
+    out = []
+    for rep in reps:
+        duration = int(rep.end_idx) - int(rep.start_idx)
+        if min_samples > 0 and duration < min_samples:
+            continue
+        if min_conf > 0 and float(rep.micro_confidence) < min_conf:
+            continue
+        out.append(rep)
+    return out
 
 
 def _train_model(
@@ -443,7 +501,7 @@ def _evaluate_streams(
             print(f"[INFO] TCN eval {stream_idx}/{len(streams)} stream={stream_id} samples={len(df)}", flush=True)
             pred = _predict_full_sequence(model, df, imu_columns, device)
         micro_probs = pred["micro_probs"]
-        macro_probs = pred["macro4_probs"]
+        macro_probs = pred["macro_probs"]
         pred_micro_labels = [MICRO_LABELS[int(i)] for i in np.argmax(micro_probs, axis=1)]
         gt_micro_labels = micro_labels_from_phase(df["phase"].to_numpy())
         gt_macro_labels = macro_labels_from_action(
@@ -461,6 +519,12 @@ def _evaluate_streams(
             pred_micro_runs,
             micro_source=micro_source,
             max_gap_samples=mm_cfg.max_phase_gap_samples,
+        )
+        pred_reps = _filter_predicted_reps(
+            pred_reps,
+            sample_rate_hz=sample_rate,
+            min_duration_seconds=mm_cfg.min_rep_duration_seconds,
+            min_confidence=mm_cfg.min_rep_confidence,
         )
         pred_reps = aggregate_action_for_reps(pred_reps, macro_probs, macro_classes)
         truth_reps = truth_reps_from_labels(
@@ -649,8 +713,10 @@ def _write_report_md(
         f"| Epochs | `{train_cfg.epochs}` |",
         f"| Slice seconds | `{mm_cfg.slice_seconds}` |",
         f"| Overlap | `{mm_cfg.overlap}` |",
+        f"| Resample to window rate | `{mm_cfg.resample_to_window_rate}` |",
         f"| TCN filters/layers | `{mm_cfg.num_filters}/{mm_cfg.num_layers}` |",
         f"| Causal convolution | `{mm_cfg.causal}` |",
+        f"| Rep post-filter | `duration>={mm_cfg.min_rep_duration_seconds}s, confidence>={mm_cfg.min_rep_confidence}` |",
         f"| DTW stride/duration/downsample/max windows | `{dtw_cfg.detection_stride}/{dtw_cfg.duration_stride or dtw_cfg.detection_stride}/{dtw_cfg.dtw_downsample_factor}/{dtw_cfg.max_windows_per_label}` |",
     ]
 
@@ -720,6 +786,11 @@ def run(
         modes = [mode]
     streams, subjects, actions = _load_streams(raw, modes)
     imu_columns = tuple(feature_cfg.get("imu_columns", ["ax", "ay", "az", "gx", "gy", "gz"]))
+    time_column = str(feature_cfg.get("time_column", "sensor_ts"))
+    target_sample_rate = int((raw.get("window", {}) or {}).get("sample_rate_hz", 50))
+    if bool(mm_cfg.resample_to_window_rate):
+        streams = _resample_streams_to_rate(streams, imu_columns, time_column, target_sample_rate)
+        print(f"[INFO] resampled streams to {target_sample_rate} Hz using time_column={time_column}", flush=True)
     subject_column = str(feature_cfg.get("subject_column", "subject_id"))
     macro_classes = [OTHER_LABEL] + [a for a in actions if a != OTHER_LABEL]
     if not streams:
@@ -760,7 +831,7 @@ def run(
     test_streams = [(sid, apply_zscore(df, imu_columns, stats)) for sid, df in test_streams]
     train_sequences = [df for _, df in train_streams]
 
-    fallback_sample_rate = float((raw.get("window", {}) or {}).get("sample_rate_hz", 50))
+    fallback_sample_rate = float(target_sample_rate)
     sample_rate = _median_sample_rate(train_streams, fallback_sample_rate)
     slice_len = max(8, int(round(float(mm_cfg.slice_seconds) * sample_rate)))
     stride_len = max(1, int(round(slice_len * (1.0 - float(mm_cfg.overlap)))))
@@ -808,6 +879,7 @@ def run(
             kernel_size=int(mm_cfg.kernel_size),
             dropout=float(mm_cfg.dropout),
             causal=bool(mm_cfg.causal),
+            num_macro_stages=int(mm_cfg.num_macro_stages),
         )
     )
     _train_model(model, loader, train_cfg, mm_cfg, use_gt_micro_probs=use_gt_micro_probs)
@@ -852,6 +924,9 @@ def run(
             "sample_rate_hz_for_training_slices": sample_rate,
             "slice_len_samples": slice_len,
             "stride_len_samples": stride_len,
+            "resample_to_window_rate": bool(mm_cfg.resample_to_window_rate),
+            "min_rep_duration_seconds": float(mm_cfg.min_rep_duration_seconds),
+            "min_rep_confidence": float(mm_cfg.min_rep_confidence),
             "primary_metrics": primary_metric_table(summary.get("overall", {}) or {}),
         }
     )
@@ -869,6 +944,9 @@ def run(
             "sample_rate_hz_for_training_slices": sample_rate,
             "slice_len_samples": slice_len,
             "stride_len_samples": stride_len,
+            "resample_to_window_rate": bool(mm_cfg.resample_to_window_rate),
+            "min_rep_duration_seconds": float(mm_cfg.min_rep_duration_seconds),
+            "min_rep_confidence": float(mm_cfg.min_rep_confidence),
         },
     )
     _write_report_md(output_dir, summary, config_path, train_cfg, mm_cfg, dtw_cfg)

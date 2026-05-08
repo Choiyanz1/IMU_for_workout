@@ -14,7 +14,6 @@ feature:
   time_column: sensor_ts
 
 window:
-  # Board target sample rate.
   sample_rate_hz: 100
 
 train:
@@ -23,42 +22,26 @@ train:
   epochs: 20
   lr: 0.0003
   weight_decay: 0.00001
-  # Held-out subject for subject-wise evaluation.
   test_subject: kevin
-  # auto prefers CUDA, then Apple Silicon MPS, then CPU.
   device: auto
-  # auto uses a small worker pool for GPU/MPS runs and stays conservative on CPU.
   num_workers: auto
-  # auto enables pinned host memory only for CUDA.
   pin_memory: auto
-  # Mixed precision is used only on CUDA; MPS/CPU keep float32.
   amp: true
 
 micro_macro:
-  # Stage 1 source. "both" runs TCN and DTW comparison runs under the same timestamp.
-  # CLI --micro-source can override this for quick comparisons.
-  micro_source: both  # both | tcn | dtw
-  #
-  # Phase order is intentionally NOT configurable:
-  #   concentric -> eccentric
+  micro_source: both
   train_on_modes: [sets, whole]
-  # Lighter causal model for board-style online inference.
   slice_seconds: 20.0
   overlap: 0.50
   num_filters: 64
   num_layers: 6
   kernel_size: 3
   dropout: 0.2
-  # Use causal dilated convolutions for future real-time inference.
-  # Set false to reproduce the paper-style non-causal/symmetric TCN.
   causal: true
-  # Number of macro refinement stages (2 = Stage 1 micro + Stage 2 macro only, 4 = full pipeline with refinement).
   num_macro_stages: 3
   alpha: 1.0
-  beta: 0.15
+  beta: 0.0
   tmse_threshold: 4.0
-  # Post-processing tuned on the current causal TCN checkpoint to suppress
-  # micro-fragment false reps while allowing short gaps between phase runs.
   max_phase_gap_samples: 3
   min_phase_samples: 3
   min_rep_duration_seconds: 1.2
@@ -72,8 +55,6 @@ micro_macro:
     duration_max_ratio: 1.75
     threshold_percentile: 75.0
     threshold_margin: 0.10
-    # DTW is CPU-bound. These defaults keep the comparison usable on long
-    # whole-session streams; lower them for a slower, denser search.
     detection_stride: 8
     duration_stride: 8
     dtw_downsample_factor: 2

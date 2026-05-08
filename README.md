@@ -413,10 +413,52 @@ python -m evaluation.streaming_micro_macro \
   --csv datasets/raw_data/<subject>/<action>/<set>/your.csv
 ```
 
-This feeds one sample at a time through a rolling buffer and writes a
-sample-by-sample CSV, a static SVG overview, and an interactive HTML replay.
-The HTML replay shows a moving cursor and changing online micro/action labels;
-it is an offline replay of online inference, not a live sensor UI.
+For set-level replay, pass the set directory directly. The script will merge
+`rep*.csv` in natural order and write `merged_set_input.csv` beside the replay
+artifacts:
+
+```bash
+python -m evaluation.streaming_micro_macro \
+  --run-dir artifacts/micro_macro_recognition/<timestamp>/tcn \
+  --csv datasets/raw_data/<subject>/<action>/set0 \
+  --max-samples -1
+```
+
+This writes a sample-by-sample CSV, a static SVG overview, and an interactive
+HTML replay. The static replay is useful for inspection after inference is
+done.
+
+To simulate a board receiving samples in real time, use live mode. This runs
+`OnlineDSMSTCNPredictor.update()` for each incoming sample and updates a browser
+dashboard while the replay is running:
+
+```bash
+python -m evaluation.streaming_micro_macro \
+  --run-dir artifacts/micro_macro_recognition/<timestamp>/tcn \
+  --csv datasets/raw_data/<subject>/<action>/set0 \
+  --max-samples -1 \
+  --live \
+  --replay-speed 1.0 \
+  --live-window-seconds 15 \
+  --live-history-seconds 60
+```
+
+Open the printed `http://127.0.0.1:<port>/live_dashboard.html` URL while the
+command is running. Use `--replay-speed 2.0` or `5.0` for faster-than-real-time
+inspection, or `--keep-server-open` if you want the local dashboard server to
+stay open after replay finishes.
+
+For board-style streams without reliable `sensor_ts`, pass the known sensor rate
+explicitly, for example `--sample-rate 50`. The live dashboard keeps only the
+recent `--live-history-seconds` samples in `live_state.json` so long realtime
+tests do not keep rewriting an ever-growing JSON file; `streaming_predictions.csv`
+still stores the full replay.
+
+For speed, replay defaults to `--method fast`, which runs the full sequence once
+with the causal TCN. For a causal checkpoint, each output still only depends on
+past samples, so this is online-equivalent for visualization. Use
+`--method step` only when you specifically want to benchmark sample-by-sample
+loop overhead.
 
 The DTW Stage 1 comparison is CPU-bound, so long whole-session streams can be
 slow. The config uses a coarse search by default:
@@ -457,6 +499,8 @@ under `<run-dir>/streaming_eval/<stream_id>/`:
 - `streaming_predictions.csv`: sample-by-sample online labels and confidences.
 - `streaming_replay.svg`: color-block overview with synchronized IMU waveforms.
 - `streaming_replay.html`: interactive replay with a moving time cursor.
+- `live_dashboard.html` / `live_state.json`: live browser dashboard files when
+  `--live` is used.
 - `streaming_summary.json`: input/output paths and buffer information.
 
 ## Student Model Artifacts (`io.output_dir`)

@@ -13,6 +13,25 @@ __pycache__/
 # macOS / editor noise
 .DS_Store
 
+# Local IDE/editor state
+.vs/
+.opencode/
+opencode.json
+
+# Local downloads and training logs
+downloads/
+catboost_info/
+
+# Dataset files will be managed separately with DVC
+datasets/raw_data/
+
+# One-off scratch/debug files
+temp_*.py
+test_env.py
+test_browse.py
+delete_test_dirs.py
+r[3])
+
 # Training and evaluation outputs
 artifacts/
 artifacts_student/

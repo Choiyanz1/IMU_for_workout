@@ -1,0 +1,131 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 560" font-family="'Segoe UI', Arial, Helvetica, sans-serif">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#374151"/>
+    </marker>
+    <linearGradient id="headerGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#1e3a5f"/>
+      <stop offset="100%" style="stop-color:#2563eb"/>
+    </linearGradient>
+    <linearGradient id="inputGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#f0f9ff"/>
+      <stop offset="100%" style="stop-color:#e0f2fe"/>
+    </linearGradient>
+    <linearGradient id="cutGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#f0fdf4"/>
+      <stop offset="100%" style="stop-color:#dcfce7"/>
+    </linearGradient>
+    <linearGradient id="classifierGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#fef3c7"/>
+      <stop offset="100%" style="stop-color:#fde68a"/>
+    </linearGradient>
+    <linearGradient id="outputGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#f3e8ff"/>
+      <stop offset="100%" style="stop-color:#e9d5ff"/>
+    </linearGradient>
+    <linearGradient id="futureGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#fef2f2"/>
+      <stop offset="100%" style="stop-color:#fee2e2"/>
+    </linearGradient>
+    <filter id="shadow" x="-5%" y="-5%" width="110%" height="115%">
+      <feDropShadow dx="1" dy="2" stdDeviation="2" flood-opacity="0.15"/>
+    </filter>
+  </defs>
+
+  <!-- Title bar -->
+  <rect x="0" y="0" width="1000" height="48" fill="url(#headerGrad)"/>
+  <text x="500" y="30" text-anchor="middle" fill="#ffffff" font-size="17" font-weight="700">整體系統架構 — System Architecture（動作辨識為 Per-Rep 層級）</text>
+
+  <!-- ===== ROW 1: Input Processing ===== -->
+  <text x="30" y="80" fill="#1e3a5f" font-size="13" font-weight="700">感測前處理</text>
+
+  <rect x="30" y="90" width="150" height="50" rx="8" fill="url(#inputGrad)" stroke="#0ea5e9" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="105" y="110" text-anchor="middle" fill="#0369a1" font-size="13" font-weight="600">IMU 串流</text>
+  <text x="105" y="128" text-anchor="middle" fill="#0ea5e9" font-size="10">6-axis 100 Hz</text>
+
+  <line x1="180" y1="115" x2="220" y2="115" stroke="#374151" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <rect x="225" y="90" width="130" height="50" rx="8" fill="url(#inputGrad)" stroke="#0ea5e9" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="290" y="110" text-anchor="middle" fill="#0369a1" font-size="13" font-weight="600">Z-score</text>
+  <text x="290" y="128" text-anchor="middle" fill="#0ea5e9" font-size="10">train-fold stats</text>
+
+  <line x1="355" y1="115" x2="395" y2="115" stroke="#374151" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <rect x="400" y="90" width="130" height="50" rx="8" fill="url(#inputGrad)" stroke="#0ea5e9" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="465" y="110" text-anchor="middle" fill="#0369a1" font-size="13" font-weight="600">Rolling Buffer</text>
+  <text x="465" y="128" text-anchor="middle" fill="#0ea5e9" font-size="10">window=50, stride=1</text>
+
+  <!-- ===== ROW 2: Rep Cutting ===== -->
+  <text x="30" y="185" fill="#1e3a5f" font-size="13" font-weight="700">Stage A：Rep Segmentation</text>
+
+  <line x1="465" y1="140" x2="465" y2="195" stroke="#374151" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Cutter switch (lightweight prefix) -->
+  <rect x="30" y="202" width="170" height="36" rx="6" fill="#f8fafc" stroke="#94a3b8" stroke-width="1.2" filter="url(#shadow)"/>
+  <text x="115" y="225" text-anchor="middle" fill="#475569" font-size="11" font-weight="600">短前綴 Cutter 選擇</text>
+
+  <line x1="200" y1="220" x2="240" y2="220" stroke="#374151" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- Per-action rep cutters -->
+  <rect x="245" y="195" width="200" height="50" rx="8" fill="url(#cutGrad)" stroke="#16a34a" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="345" y="215" text-anchor="middle" fill="#166534" font-size="12" font-weight="600">Action-Conditioned</text>
+  <text x="345" y="233" text-anchor="middle" fill="#16a34a" font-size="11">RF Phase + Boundary Refiner</text>
+
+  <line x1="445" y1="220" x2="485" y2="220" stroke="#374151" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <rect x="490" y="195" width="200" height="50" rx="8" fill="url(#cutGrad)" stroke="#16a34a" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="590" y="215" text-anchor="middle" fill="#166534" font-size="12" font-weight="600">Refined Reps</text>
+  <text x="590" y="233" text-anchor="middle" fill="#16a34a" font-size="11">start / transition / end</text>
+
+  <!-- ===== ROW 3: Per-Rep Action Recognition ===== -->
+  <text x="30" y="295" fill="#1e3a5f" font-size="13" font-weight="700">Stage B：每 Rep 完成後 — 動作辨識（主體）</text>
+
+  <line x1="590" y1="245" x2="590" y2="305" stroke="#374151" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <rect x="30" y="312" width="200" height="50" rx="8" fill="url(#classifierGrad)" stroke="#d97706" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="130" y="332" text-anchor="middle" fill="#92400e" font-size="12" font-weight="600">Per-Rep Feature Extraction</text>
+  <text x="130" y="350" text-anchor="middle" fill="#d97706" font-size="10">duration / stats / freq / shape</text>
+
+  <line x1="230" y1="337" x2="270" y2="337" stroke="#374151" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <rect x="275" y="312" width="200" height="50" rx="8" fill="url(#classifierGrad)" stroke="#d97706" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="375" y="332" text-anchor="middle" fill="#92400e" font-size="12" font-weight="600">Rep-Complete Classifier</text>
+  <text x="375" y="350" text-anchor="middle" fill="#d97706" font-size="10">Logistic Regression / RF / XGBoost</text>
+
+  <line x1="475" y1="337" x2="515" y2="337" stroke="#374151" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <rect x="520" y="312" width="200" height="50" rx="8" fill="url(#classifierGrad)" stroke="#d97706" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="620" y="332" text-anchor="middle" fill="#92400e" font-size="12" font-weight="600">Hybrid Fusion</text>
+  <text x="620" y="350" text-anchor="middle" fill="#d97706" font-size="10">macro + classifier confidence</text>
+
+  <!-- ===== ROW 4: Outputs ===== -->
+  <text x="30" y="400" fill="#1e3a5f" font-size="13" font-weight="700">輸出</text>
+
+  <line x1="620" y1="362" x2="620" y2="410" stroke="#374151" stroke-width="2"/>
+  <line x1="300" y1="410" x2="620" y2="410" stroke="#374151" stroke-width="2"/>
+  <line x1="300" y1="410" x2="300" y2="420" stroke="#374151" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="500" y1="410" x2="500" y2="420" stroke="#374151" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="700" y1="410" x2="700" y2="420" stroke="#374151" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <rect x="200" y="425" width="200" height="50" rx="8" fill="url(#outputGrad)" stroke="#9333ea" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="300" y="445" text-anchor="middle" fill="#6b21a8" font-size="13" font-weight="600">穩定動作標籤</text>
+  <text x="300" y="463" text-anchor="middle" fill="#9333ea" font-size="10">per-rep 累積多數決</text>
+
+  <rect x="420" y="425" width="160" height="50" rx="8" fill="url(#outputGrad)" stroke="#9333ea" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="500" y="445" text-anchor="middle" fill="#6b21a8" font-size="13" font-weight="600">Rep Count</text>
+  <text x="500" y="463" text-anchor="middle" fill="#9333ea" font-size="10">已完成的 reps</text>
+
+  <rect x="600" y="425" width="200" height="50" rx="8" fill="url(#outputGrad)" stroke="#9333ea" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="700" y="445" text-anchor="middle" fill="#6b21a8" font-size="13" font-weight="600">向心 / 離心切分</text>
+  <text x="700" y="463" text-anchor="middle" fill="#9333ea" font-size="10">concentric / eccentric</text>
+
+  <!-- Legend -->
+  <rect x="30" y="510" width="12" height="12" fill="#dcfce7" stroke="#16a34a" stroke-width="1"/>
+  <text x="48" y="521" fill="#374151" font-size="11">rep segmentation 主線</text>
+
+  <rect x="200" y="510" width="12" height="12" fill="#fef3c7" stroke="#d97706" stroke-width="1"/>
+  <text x="218" y="521" fill="#374151" font-size="11">動作辨識（per-rep）</text>
+
+  <rect x="370" y="510" width="12" height="12" fill="#f3e8ff" stroke="#9333ea" stroke-width="1"/>
+  <text x="388" y="521" fill="#374151" font-size="11">輸出</text>
+</svg>

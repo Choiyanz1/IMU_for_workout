@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <title>報告與論文材料樣板</title>
+  <style>
+    body { font-family: "Segoe UI", Arial, sans-serif; margin: 24px; line-height: 1.5; color: #1f2937; }
+    h1, h2, h3 { margin-top: 28px; }
+    .card { border: 1px solid #d1d5db; border-radius: 10px; padding: 16px; margin: 18px 0; background: #ffffff; }
+    .placeholder { border: 2px dashed #9ca3af; border-radius: 10px; min-height: 180px; display: flex; align-items: center; justify-content: center; color: #6b7280; background: #f9fafb; }
+    table { border-collapse: collapse; width: 100%; margin-top: 12px; }
+    th, td { border: 1px solid #d1d5db; padding: 8px 10px; text-align: left; }
+    th { background: #f3f4f6; }
+    .caption { margin-top: 8px; color: #4b5563; font-size: 14px; }
+    code { background: #f3f4f6; padding: 1px 5px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>報告與論文材料樣板</h1>
+
+  <div class="card">
+    <h2>圖 1：整體系統架構圖</h2>
+    <img src="assets/system_architecture.svg" style="width:100%; max-width:1000px; border:1px solid #d1d5db; border-radius:8px;" alt="系統架構圖"/>
+    <div class="caption">主流程：IMU 串流 → 短前綴選擇 rep cutter → action-conditioned rep segmentation → 每完成一個 rep 後進行 rep-complete action classification → rep count / phase split。動作辨識是 per-rep 層級，非 prefix 層級。疲勞預測標註為未來延伸（IMU + PPG）。</div>
+  </div>
+
+  <div class="card">
+    <h2>圖 2：目前主線 rep-cutting 架構圖</h2>
+    <img src="assets/rf_rep_cutting_architecture.svg" style="width:100%; max-width:900px; border:1px solid #d1d5db; border-radius:8px;" alt="RF rep-cutting 架構圖"/>
+    <div class="caption">詳細 pipeline：6-axis IMU → z-score 正規化 → causal RF phase detector → phase 解碼與 rep 配對 → boundary refiner（ExtraTrees × 3）→ 最終 refined reps。</div>
+  </div>
+
+  <div class="card">
+    <h2>表 1：主模型與常見 baseline 比較</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>模型</th>
+          <th>是否 causal</th>
+          <th>是否可部署</th>
+          <th>Precision</th>
+          <th>Recall</th>
+          <th>Rep F1</th>
+          <th>micro_f1@50</th>
+          <th>備註</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>目前主線：RF + boundary refiner</td>
+          <td>是</td>
+          <td>尚未完成 Luckfox runtime</td>
+          <td>0.8648</td>
+          <td>0.8869</td>
+          <td>0.8757</td>
+          <td>0.8126</td>
+          <td>guarded held-out <code>yoru</code></td>
+        </tr>
+        <tr>
+          <td>BiLSTM</td>
+          <td>否</td>
+          <td>不適合即時串流</td>
+          <td>待補</td>
+          <td>待補</td>
+          <td>待補</td>
+          <td>待補</td>
+          <td>請用 held-out 結果替換</td>
+        </tr>
+        <tr>
+          <td>phase-only causal TCN</td>
+          <td>是</td>
+          <td>理論上可</td>
+          <td>待補</td>
+          <td>待補</td>
+          <td>待補</td>
+          <td>待補</td>
+          <td>請用 held-out 結果替換</td>
+        </tr>
+        <tr>
+          <td>DS-MS-TCN</td>
+          <td>是</td>
+          <td>板端路徑未完成</td>
+          <td>待補</td>
+          <td>待補</td>
+          <td>待補</td>
+          <td>待補</td>
+          <td>可放作對照</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>表 2：Modality / guardrail 消融</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>設定</th>
+          <th>模態範圍</th>
+          <th>Selection 指標</th>
+          <th>是否 count-aware</th>
+          <th>Rep F1</th>
+          <th>Recall</th>
+          <th>exact-count</th>
+          <th>備註</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>free search</td>
+          <td>待補</td>
+          <td>待補</td>
+          <td>否</td>
+          <td>待補</td>
+          <td>待補</td>
+          <td>待補</td>
+          <td>請補舊版 nested 結果</td>
+        </tr>
+        <tr>
+          <td>modality-only</td>
+          <td>雙模態 + 全模態</td>
+          <td>rep_f1</td>
+          <td>部分</td>
+          <td>待補</td>
+          <td>待補</td>
+          <td>待補</td>
+          <td>請補 smoke 或 held-out 結果</td>
+        </tr>
+        <tr>
+          <td>count-aware guarded</td>
+          <td>雙模態 + 全模態</td>
+          <td>rep_f1 + count consistency</td>
+          <td>是</td>
+          <td>0.8757</td>
+          <td>0.8869</td>
+          <td>19 / 25</td>
+          <td><code>modality_count_guardrail_yoru_v1</code></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>表 3：Phase-first 與 Direct-rep quick probe 比較</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>方法</th>
+          <th>Held-out subject</th>
+          <th>動作</th>
+          <th>Precision</th>
+          <th>Recall</th>
+          <th>Rep F1</th>
+          <th>exact-count</th>
+          <th>結論</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>phase-first RF</td>
+          <td>yoru</td>
+          <td>db_triceps_curl</td>
+          <td>1.0000</td>
+          <td>1.0000</td>
+          <td>1.0000</td>
+          <td>3 / 3</td>
+          <td>目前主線較穩</td>
+        </tr>
+        <tr>
+          <td>direct event RF（relaxed probe）</td>
+          <td>yoru</td>
+          <td>db_triceps_curl</td>
+          <td>0.9474</td>
+          <td>0.5143</td>
+          <td>0.6667</td>
+          <td>0 / 3</td>
+          <td>under-segmentation 明顯</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>表 4：Rep-Complete Action Classifier 比較（held-out yoru・2468 train reps・274 test reps）</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>模型</th>
+          <th>輸入型態</th>
+          <th>Accuracy</th>
+          <th>Macro F1</th>
+          <th>備註</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr style="background:#fefce8"><td><strong>1D CNN</strong></td><td>raw signal</td><td><strong>0.7810</strong></td><td><strong>0.7572</strong></td><td><strong>最佳模型・簡單高效</strong></td></tr>
+        <tr><td>TCN</td><td>raw signal</td><td>0.7591</td><td>0.7290</td><td>CNN 家族但更深的 temporal context</td></tr>
+        <tr><td>SVM (RBF)</td><td>rich features</td><td>0.7555</td><td>0.7354</td><td>經典 baseline・特徵工程後很強</td></tr>
+        <tr><td>k-NN (k=5)</td><td>rich features</td><td>0.7518</td><td>0.7283</td><td>簡單但意外有效</td></tr>
+        <tr><td>CatBoost</td><td>rich features</td><td>0.7336</td><td>0.7068</td><td>boosting 家族最佳</td></tr>
+        <tr><td>Logistic Regression</td><td>rich features</td><td>0.7226</td><td>0.6792</td><td>線性 baseline</td></tr>
+        <tr><td>XGBoost</td><td>rich features</td><td>0.7117</td><td>0.6784</td><td>-</td></tr>
+        <tr><td>Random Forest</td><td>rich features</td><td>0.6861</td><td>0.6523</td><td>400 trees・需要更細調</td></tr>
+        <tr><td>BiLSTM</td><td>raw signal</td><td>0.6569</td><td>0.6328</td><td>短序列下雙向優勢不明顯</td></tr>
+      </tbody>
+    </table>
+    <div class="caption">所有模型共用相同的 163 維 rich features 或 resampled raw signal。LightGBM 因 pandas 相容性問題跳過。Feature-based models 使用 <code>_compute_rich_features</code>（stats + RMS + IQR + ZCR + autocorrelation + FFT + inter-axis correlation）。</div>
+  </div>
+
+  <div class="card">
+    <h2>表 5：前綴長度 vs Cutter Switch 準確率</h2>
+    <div class="caption">目的為確保 cutter 選擇正確，非主動作辨識。</div>
+    <table>
+      <thead>
+        <tr>
+          <th>前綴長度</th>
+          <th>Top-1 Accuracy</th>
+          <th>Top-2 Accuracy</th>
+          <th>備註</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>0.5 s</td><td>待補</td><td>待補</td><td>待補</td></tr>
+        <tr><td>1.0 s</td><td>待補</td><td>待補</td><td>待補</td></tr>
+        <tr><td>2.0 s</td><td>待補</td><td>待補</td><td>待補</td></tr>
+        <tr><td>3.0 s</td><td>待補</td><td>待補</td><td>待補</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>圖 3：1D CNN Rep-Complete Classifier Confusion Matrix（yoru held-out）</h2>
+    <div class="placeholder">待替換：將 <code>artifacts/baseline_comparison/rep_complete_classifier_yoru_v2/results.json</code> 裡 1D CNN 的 confusion matrix 視覺化</div>
+    <div class="caption">總體 accuracy 0.7810・macro F1 0.7572。8 個動作中大部分有 70%+ recall。</div>
+  </div>
+
+  <div class="card">
+    <h2>圖 4：End-to-End 系統展示</h2>
+    <div class="placeholder">待替換：同一條 stream 的 rep segmentation 結果、每 rep 的 action classifier 輸出、rep count、多個時間軸疊圖</div>
+  </div>
+
+  <div class="card">
+    <h2>表 6：部署可行性摘要</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>項目</th>
+          <th>目前主線 RF + refiner</th>
+          <th>DS-MS-TCN / Student 路徑</th>
+          <th>目前判讀</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>準度</td>
+          <td>yoru held-out: Rep F1 0.8757</td>
+          <td>待補最適對照</td>
+          <td>RF 主線較強</td>
+        </tr>
+        <tr>
+          <td>模型大小</td>
+          <td>待補 deploy artifact</td>
+          <td>已有 ONNX / student 路徑</td>
+          <td>RF 缺 deploy artifact</td>
+        </tr>
+        <tr>
+          <td>記憶體</td>
+          <td>待補 Luckfox 實測</td>
+          <td>已有部分可行性分析</td>
+          <td>RF 未驗證</td>
+        </tr>
+        <tr>
+          <td>延遲</td>
+          <td>待補 Luckfox 實測</td>
+          <td>已有舊路徑 streaming 參考</td>
+          <td>RF 未驗證</td>
+        </tr>
+        <tr>
+          <td>是否可直接上 Luckfox</td>
+          <td>否</td>
+          <td>部分路徑較接近</td>
+          <td>RF 目前為 offline reference</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+</body>
+</html>

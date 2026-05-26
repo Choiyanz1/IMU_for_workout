@@ -1,0 +1,170 @@
+{
+  "registry_date": "2026-05-19",
+  "purpose": "Frozen comparison rows for related-work and same-dataset baseline tables. Future work should update current_ours rows from artifacts, while fixed_rows remain unchanged unless a baseline is deliberately rerun under a new locked protocol.",
+  "current_ours_sources": {
+    "raw6_comprehensive": "artifacts/cnn_variant_comparison/raw6_cnn_comprehensive_9fold_gpu_h64e20.json",
+    "selective_duration_merge": "artifacts/cnn_variant_comparison/selective_duration_merge_decoder_9fold_gpu_h64e20.json",
+    "count_calibration": "artifacts/cnn_variant_comparison/count_calibration_from_raw6_loso.json",
+    "active_detector_thr06": "artifacts/figures/active_detector_rest_aware_thr06_examples/active_detector_rest_examples.json"
+  },
+  "same_dataset_baselines_source": "artifacts/fixed_baseline_comparison/same_dataset_9fold_20260519.json",
+  "same_dataset_deep_baselines_source": "artifacts/fixed_baseline_comparison/deep_same_dataset_9fold_20260519.json",
+  "fixed_rows": [
+    {
+      "group": "Literature",
+      "method": "RecoFit (Morris et al. 2014)",
+      "protocol": "Wearable repetitive exercise detection/recognition/counting",
+      "recognition": "NR in verified metadata",
+      "count_exact_or_within1": "Commonly cited 93% within +/-1 rep",
+      "count_mae": "NR",
+      "segmentation": "exercise-period segmentation P/R >95% commonly cited",
+      "phase_or_ce": "N/A",
+      "real_time": "wearable-use oriented",
+      "status": "fixed_literature; full-text metric check recommended"
+    },
+    {
+      "group": "Literature",
+      "method": "ExerSense (Ishii et al. 2020)",
+      "protocol": "Real-time IMU exercise segmentation/classification/counting",
+      "recognition": "classification included; exact value needs full-text check",
+      "count_exact_or_within1": "NR in verified metadata",
+      "count_mae": "NR",
+      "segmentation": "P/R/F1 97.9/93.9/95.9% from project notes",
+      "phase_or_ce": "N/A",
+      "real_time": "explicit real-time algorithm",
+      "status": "fixed_literature; full-text metric check recommended"
+    },
+    {
+      "group": "Literature",
+      "method": "Soro et al. 2019",
+      "protocol": "Smartwatch, 10 CrossFit-style exercises",
+      "recognition": "accuracy 99.96%",
+      "count_exact_or_within1": "91% within +/-1 rep",
+      "count_mae": "NR",
+      "segmentation": "NR",
+      "phase_or_ce": "N/A",
+      "real_time": "not clearly board-streaming",
+      "status": "fixed_literature; values verified from abstract"
+    },
+    {
+      "group": "Literature",
+      "method": "Prabhu et al. 2020",
+      "protocol": "Wearable IMU, local muscular endurance rehab exercises",
+      "recognition": "F1 97.18%",
+      "count_exact_or_within1": "90% within +/-1 rep",
+      "count_mae": "NR",
+      "segmentation": "NR",
+      "phase_or_ce": "N/A",
+      "real_time": "remote rehab oriented",
+      "status": "fixed_literature; values verified from abstract"
+    },
+    {
+      "group": "Literature",
+      "method": "MM-Fit (Stromback et al. 2020)",
+      "protocol": "Multimodal workout logging, unseen-subject evaluation",
+      "recognition": "96% all modalities; 94% smartwatch-only",
+      "count_exact_or_within1": "NR in verified metadata",
+      "count_mae": "project notes mention smartwatch gyro MAE 0.34 reps/set",
+      "segmentation": "activity segmentation supported; rep IoU not in metadata",
+      "phase_or_ce": "N/A",
+      "real_time": "not board-focused",
+      "status": "fixed_literature; full-text count metric check required"
+    },
+    {
+      "group": "Literature",
+      "method": "Hsu et al. 2021",
+      "protocol": "Video skeleton, UI-PRMD and MM-Fit",
+      "recognition": "N/A",
+      "count_exact_or_within1": "OBOA 0.94 MM-Fit, 0.95 UI-PRMD",
+      "count_mae": "0.06 as reported; definition differs from absolute set-count MAE",
+      "segmentation": "counting only",
+      "phase_or_ce": "N/A",
+      "real_time": "CPU ~0.001s/input reported",
+      "status": "fixed_literature; values verified from arXiv abstract"
+    },
+    {
+      "group": "Literature",
+      "method": "Abedi et al. 2023",
+      "protocol": "Skeletal joints, KIMORE/UI-PRMD/IntelliRehabDS",
+      "recognition": "N/A",
+      "count_exact_or_within1": "NR",
+      "count_mae": "0.531/0.58/0.72 absolute count MAE",
+      "segmentation": "mean segment IoU 0.689/0.82/0.68",
+      "phase_or_ce": "N/A",
+      "real_time": "not explicitly edge",
+      "status": "fixed_literature; full-text table check recommended"
+    },
+    {
+      "group": "Literature",
+      "method": "DS-MS-TCN Otago (Shang et al. 2024)",
+      "protocol": "Single waist IMU, Otago exercise recognition/segmentation",
+      "recognition": "recognition/segmentation task",
+      "count_exact_or_within1": "N/A",
+      "count_mae": "N/A",
+      "segmentation": "macro segment IoU-F1@50 0.633-0.923 by activity",
+      "phase_or_ce": "micro/macro exercise labels, not C/E",
+      "real_time": "seq-to-seq; not explicitly edge",
+      "status": "fixed_literature; full-text table check recommended"
+    },
+    {
+      "group": "Literature",
+      "method": "King et al. 2025",
+      "protocol": "Single wrist 6-axis IMU, preacher curls to failure",
+      "recognition": "near-failure classifier F1 0.82",
+      "count_exact_or_within1": "NR",
+      "count_mae": "NR",
+      "segmentation": "rep segmentation F1 0.83",
+      "phase_or_ce": "N/A",
+      "real_time": "1.6 Hz simulated real-time; 112 ms Raspberry Pi 5, 23.5 ms iPhone 16",
+      "status": "fixed_literature; values verified from abstract"
+    },
+    {
+      "group": "Internal legacy baseline",
+      "method": "Sliding-window Random Forest",
+      "protocol": "Legacy baseline comparison artifact; not current 9-fold raw6 protocol",
+      "recognition": "rep_action_accuracy 0.0 in artifact",
+      "count_exact_or_within1": "NR",
+      "count_mae": "NR",
+      "segmentation": "Rep F1 0.661; micro IoU-F1@50 0.362",
+      "phase_or_ce": "micro sample acc 0.589; macro F1 0.479",
+      "real_time": "eval_time_s 2429.8 in artifact",
+      "status": "fixed_legacy; use only as dev baseline unless formally rerun"
+    },
+    {
+      "group": "Internal legacy baseline",
+      "method": "BiLSTM",
+      "protocol": "Legacy baseline comparison artifact; not current 9-fold raw6 protocol",
+      "recognition": "rep_action_accuracy 0.0 in artifact",
+      "count_exact_or_within1": "NR",
+      "count_mae": "NR",
+      "segmentation": "Rep F1 0.705; micro IoU-F1@50 0.421",
+      "phase_or_ce": "micro sample acc 0.618; macro F1 0.404",
+      "real_time": "136,579 params; eval_time_s 1.38 in artifact",
+      "status": "fixed_legacy; use only as dev baseline unless formally rerun"
+    },
+    {
+      "group": "Internal legacy baseline",
+      "method": "Plain 1D CNN",
+      "protocol": "Legacy baseline comparison artifact; not current 9-fold raw6 protocol",
+      "recognition": "rep_action_accuracy 0.0 in artifact",
+      "count_exact_or_within1": "NR",
+      "count_mae": "NR",
+      "segmentation": "Rep F1 0.495; micro IoU-F1@50 0.248",
+      "phase_or_ce": "micro sample acc 0.556; macro F1 0.357",
+      "real_time": "64,323 params; eval_time_s 1.28 in artifact",
+      "status": "fixed_legacy; use only as dev baseline unless formally rerun"
+    },
+    {
+      "group": "Internal legacy baseline",
+      "method": "DS-MS-TCN (repo legacy)",
+      "protocol": "Legacy repo baseline comparison artifact; deprecated as deploy candidate",
+      "recognition": "rep_action_accuracy 0.807",
+      "count_exact_or_within1": "NR",
+      "count_mae": "NR",
+      "segmentation": "Rep F1 0.683; micro IoU-F1@50 0.386; macro IoU-F1@50 0.361",
+      "phase_or_ce": "micro sample acc 0.640; macro sample acc 0.782",
+      "real_time": "299,410 params; eval_time_s 1.52 in artifact",
+      "status": "fixed_legacy; deprecated; use only as historical comparison"
+    }
+  ]
+}

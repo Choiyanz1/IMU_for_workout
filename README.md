@@ -76,6 +76,10 @@ write a common comparison layer whenever possible:
 This keeps model-specific details intact while making different models easier
 to compare.
 
+統一指標說明請見：
+
+- `docs/specs/metrics.md`
+
 Create a cross-run comparison table:
 
 ```bash
@@ -338,6 +342,145 @@ order `concentric -> eccentric`. Stages 2-4 predict and refine macro labels
 (`other + action_type`), so the same model can also provide per-rep action
 labels.
 
+Current pipeline structure:
+
+```text
+Raw IMU [ax, ay, az, gx, gy, gz]
+        |
+        v
++-------------------------+
+| Stage 1 Micro TCN       |
+| other / con / ecc       |
++-------------------------+
+        |
+        | micro probabilities
+        v
++-------------------------+
+| Stage 2 Macro TCN       |
+| other + action_type     |
++-------------------------+
+        |
+        v
++-------------------------+
+| Stage 3/4 Refinement    |
++-------------------------+
+        |
+        +--> macro labels / action plots
+        |
+        +--> phase decoder: con -> ecc -> rep
+```
+
+這和傳統 sliding-window classification 不同。模型不是對每個 window
+輸出一個類別，而是對每個 sample 都輸出一個標籤：
+
+```text
+Input:  [B, C, T]
+Output: [B, classes, T]
+```
+
+### Why the current Stage 1 is both useful and limited
+
+目前 Stage 1 只使用三個 phase 類別：
+
+- `other`
+- `concentric`
+- `eccentric`
+
+這對穩定的 rep pairing 很有幫助，但也會把很多本質上不同的動作型態
+壓縮進同一個 phase 類別：
+
+```text
+db_rdl::concentric
+db_weighted_crunch::concentric
+one_arm_db_row::concentric
+        |
+        v
+all become the same "concentric" class
+```
+
+也就是說，目前的 phase head 雖然能比較穩地找邊界，但仍然會丟失
+exercise-specific 的 micro 語意。
+
+### Why not just replace Stage 1 with full action-aware micro labels?
+
+一個很直觀的想法是直接改成 action-aware micro labels：
+
+```text
+Raw IMU
+   |
+   v
++--------------------------------------+
+| Action-aware micro Stage 1           |
+| other                                |
+| db_rdl::con / db_rdl::ecc            |
+| crunch::con / crunch::ecc            |
+| row::con / row::ecc                  |
+| bench::con / bench::ecc              |
++--------------------------------------+
+```
+
+這在語意上更貼近真實情況，因為不同 exercise 的向心/離心訊號確實不一樣。
+
+但如果直接整個替換掉目前的 3-class phase head，訓練問題會立刻變難：
+
+```text
+3 classes
+  -> many more classes
+  -> fewer examples per class
+  -> noisier boundaries
+  -> lower phase IoU if loss/decoder stay unchanged
+```
+
+這也是目前實驗觀察到的結果：
+
+- action-aware micro labels 讓 rep-level action identity 明顯變好
+- 但 phase-level 的 `micro_f1_at_50` 反而下降
+
+### Does a phase-first design cause cascading mistakes?
+
+如果系統是做成硬式串接（hard cascade），確實會有錯誤傳遞問題：
+
+```text
+Raw IMU
+  -> predict con/ecc
+  -> argmax
+  -> use that hard decision to predict action-aware micro label
+```
+
+也就是前面 phase 判錯，後面 action-aware 判斷就一起被帶歪。
+
+因此，比較好的下一步不是硬式兩段判斷，而是用 shared backbone 搭配
+平行雙頭：
+
+```text
+Raw IMU
+   |
+   v
++-----------------------------+
+| Shared Temporal Backbone    |
++-----------------------------+
+        |                |
+        |                |
+        v                v
++---------------+   +----------------------+
+| Phase Head    |   | Action-aware Head    |
+| other/con/ecc |   | rdl::con, ...        |
++---------------+   +----------------------+
+        |                |
+        |                +--> auxiliary action-aware loss
+        |
+        +--> structured decoder / rep pairing
+```
+
+在這種設計裡：
+
+- phase head 仍然專門負責穩定的 rep 邊界；
+- action-aware head 負責學不同 exercise 的 phase 語意差異；
+- action-aware branch 不需要依賴 phase head 的 hard argmax 結果。
+
+這樣可以同時保留目前 rep decoder 的穩定性，並補上單純 3-class phase
+taxonomy 缺少的語意資訊。
+
 By default, `configs/micro_macro_recognition.yaml` runs both Stage 1 sources
 under the same timestamped output folder:
 
@@ -447,6 +590,51 @@ Open the printed `http://127.0.0.1:<port>/live_dashboard.html` URL while the
 command is running. Use `--replay-speed 2.0` or `5.0` for faster-than-real-time
 inspection, or `--keep-server-open` if you want the local dashboard server to
 stay open after replay finishes.
+
+If you want a simpler one-click workflow for the built-in demos, use:
+
+```bash
+scripts\run_live_demo.cmd
+```
+
+This launcher lets you choose:
+
+- model/checkpoint
+- demo stream
+- or a custom run directory and custom csv/set directory
+
+The bundled demo launchers now support:
+
+- `--open-browser`: automatically opens the live dashboard
+- `--startup-delay-seconds`: waits a few seconds before replay starts so the page is already visible
+- `--keep-server-open`: keeps the page available after replay ends
+
+For app-style stable display, the streaming evaluator now also supports an
+event-driven display state machine:
+
+```text
+sample-by-sample phase prediction
+        -> completed rep event
+        -> display_rep_count += 1
+        -> display_action updates only after enough recent completed reps agree
+```
+
+Useful knobs:
+
+```bash
+--display-vote-window 3
+--display-min-reps 2
+--display-min-fraction 0.67
+--display-min-confidence 0.0
+```
+
+This writes stable app-facing fields into `streaming_predictions.csv` and
+`display_events.csv`, including:
+
+- `display_rep_count`
+- `display_action`
+- `display_action_confidence`
+- `display_action_locked`
 
 For board-style streams without reliable `sensor_ts`, pass the known sensor rate
 explicitly, for example `--sample-rate 50`. The live dashboard keeps only the

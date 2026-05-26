@@ -122,6 +122,11 @@ def _subject_dirs(data_dir: Path) -> List[Path]:
     return [p for p in sorted(data_dir.iterdir()) if p.is_dir()]
 
 
+def _session_dirs(subject_dir: Path) -> List[Path]:
+    """Return session subdirectories within a subject folder."""
+    return [p for p in sorted(subject_dir.iterdir()) if p.is_dir()]
+
+
 def _load_rep_csvs(
     data_dir: Path,
     subject: str,
@@ -129,58 +134,63 @@ def _load_rep_csvs(
     exclude_patterns: Sequence[str],
     sdtw_cfg: SDTWConfig,
 ) -> List[pd.DataFrame]:
-    action_dir = data_dir / subject / action
-    if not action_dir.exists():
+    subject_dir = data_dir / subject
+    if not subject_dir.exists():
         return []
     frames: List[pd.DataFrame] = []
-    for set_dir in sorted(p for p in action_dir.iterdir() if p.is_dir() and p.name.startswith("set")):
-        if _matches_any_path_part(set_dir, data_dir, exclude_patterns):
+    for session_dir in _session_dirs(subject_dir):
+        session = session_dir.name
+        action_dir = session_dir / action
+        if not action_dir.exists():
             continue
-        csv_paths = [
-            p for p in sorted(set_dir.glob("*.csv"), key=_natural_sort_key)
-            if not _matches_any_path_part(p, data_dir, exclude_patterns)
-            and "whole_session" not in p.name
-        ]
-        n_reps = len(csv_paths)
-        if n_reps == 0:
-            continue
-
-        middle_fraction = min(max(float(sdtw_cfg.template_middle_fraction), 0.0), 1.0)
-        side_fraction = (1.0 - middle_fraction) / 2.0
-        start_rank = int(np.floor(n_reps * side_fraction))
-        end_rank = int(np.ceil(n_reps * (1.0 - side_fraction)))
-        edge = int(sdtw_cfg.template_min_edge_reps)
-        if n_reps >= edge * 2 + 1:
-            start_rank = max(start_rank, edge)
-            end_rank = min(end_rank, n_reps - edge)
-        if start_rank >= end_rank:
-            center = n_reps // 2
-            start_rank = center
-            end_rank = center + 1
-
-        for rep_rank, csv_path in enumerate(csv_paths):
-            try:
-                df = pd.read_csv(csv_path)
-            except Exception:
+        for set_dir in sorted(p for p in action_dir.iterdir() if p.is_dir() and p.name.startswith("set")):
+            if _matches_any_path_part(set_dir, data_dir, exclude_patterns):
                 continue
-            if "phase" not in df.columns:
+            csv_paths = [
+                p for p in sorted(set_dir.glob("*.csv"), key=_natural_sort_key)
+                if not _matches_any_path_part(p, data_dir, exclude_patterns)
+                and "whole_session" not in p.name
+            ]
+            n_reps = len(csv_paths)
+            if n_reps == 0:
                 continue
-            rep_position = rep_rank / max(1, n_reps - 1)
-            is_template_candidate = start_rank <= rep_rank < end_rank
-            df = df.copy()
-            df["_source_path"] = str(csv_path.relative_to(data_dir))
-            df["_subject_id"] = subject
-            df["_action_type"] = action
-            df["_set_name"] = set_dir.name
-            df["_rep_rank_in_set"] = rep_rank
-            df["_rep_count_in_set"] = n_reps
-            df["_rep_position"] = rep_position
-            df["_template_candidate"] = is_template_candidate
-            df.attrs["source_path"] = str(csv_path.relative_to(data_dir))
-            df.attrs["source_id"] = f"{subject}/{action}/{set_dir.name}/{csv_path.stem}"
-            df.attrs["rep_position"] = rep_position
-            df.attrs["template_candidate"] = is_template_candidate
-            frames.append(df)
+
+            middle_fraction = min(max(float(sdtw_cfg.template_middle_fraction), 0.0), 1.0)
+            side_fraction = (1.0 - middle_fraction) / 2.0
+            start_rank = int(np.floor(n_reps * side_fraction))
+            end_rank = int(np.ceil(n_reps * (1.0 - side_fraction)))
+            edge = int(sdtw_cfg.template_min_edge_reps)
+            if n_reps >= edge * 2 + 1:
+                start_rank = max(start_rank, edge)
+                end_rank = min(end_rank, n_reps - edge)
+            if start_rank >= end_rank:
+                center = n_reps // 2
+                start_rank = center
+                end_rank = center + 1
+
+            for rep_rank, csv_path in enumerate(csv_paths):
+                try:
+                    df = pd.read_csv(csv_path)
+                except Exception:
+                    continue
+                if "phase" not in df.columns:
+                    continue
+                rep_position = rep_rank / max(1, n_reps - 1)
+                is_template_candidate = start_rank <= rep_rank < end_rank
+                df = df.copy()
+                df["_source_path"] = str(csv_path.relative_to(data_dir))
+                df["_subject_id"] = subject
+                df["_action_type"] = action
+                df["_set_name"] = set_dir.name
+                df["_rep_rank_in_set"] = rep_rank
+                df["_rep_count_in_set"] = n_reps
+                df["_rep_position"] = rep_position
+                df["_template_candidate"] = is_template_candidate
+                df.attrs["source_path"] = str(csv_path.relative_to(data_dir))
+                df.attrs["source_id"] = f"{subject}/{session}/{action}/{set_dir.name}/{csv_path.stem}"
+                df.attrs["rep_position"] = rep_position
+                df.attrs["template_candidate"] = is_template_candidate
+                frames.append(df)
     return frames
 
 
@@ -190,29 +200,34 @@ def _load_set_streams(
     action: str,
     exclude_patterns: Sequence[str],
 ) -> List[Tuple[str, pd.DataFrame]]:
-    action_dir = data_dir / subject / action
-    if not action_dir.exists():
+    subject_dir = data_dir / subject
+    if not subject_dir.exists():
         return []
     streams: List[Tuple[str, pd.DataFrame]] = []
-    for set_dir in sorted(action_dir.iterdir()):
-        if not set_dir.is_dir() or not set_dir.name.startswith("set"):
+    for session_dir in _session_dirs(subject_dir):
+        session = session_dir.name
+        action_dir = session_dir / action
+        if not action_dir.exists():
             continue
-        if _matches_any_path_part(set_dir, data_dir, exclude_patterns):
-            continue
-        csvs = sorted(set_dir.glob("*.csv"), key=_natural_sort_key)
-        frames: List[pd.DataFrame] = []
-        for csv_path in csvs:
-            try:
-                df = pd.read_csv(csv_path)
-            except Exception:
+        for set_dir in sorted(action_dir.iterdir()):
+            if not set_dir.is_dir() or not set_dir.name.startswith("set"):
                 continue
-            if "phase" not in df.columns:
+            if _matches_any_path_part(set_dir, data_dir, exclude_patterns):
                 continue
-            df = df.copy()
-            df["_source_file"] = csv_path.name
-            frames.append(df)
-        if frames:
-            streams.append((f"{subject}/{action}/{set_dir.name}", pd.concat(frames, ignore_index=True)))
+            csvs = sorted(set_dir.glob("*.csv"), key=_natural_sort_key)
+            frames: List[pd.DataFrame] = []
+            for csv_path in csvs:
+                try:
+                    df = pd.read_csv(csv_path)
+                except Exception:
+                    continue
+                if "phase" not in df.columns:
+                    continue
+                df = df.copy()
+                df["_source_file"] = csv_path.name
+                frames.append(df)
+            if frames:
+                streams.append((f"{subject}/{session}/{action}/{set_dir.name}", pd.concat(frames, ignore_index=True)))
     return streams
 
 
@@ -221,7 +236,10 @@ def _load_whole_streams(
     subject: str,
     action: str,
 ) -> List[Tuple[str, pd.DataFrame]]:
-    whole_files = sorted((data_dir / subject).glob("*whole_session*.csv"))
+    subject_dir = data_dir / subject
+    whole_files = []
+    for session_dir in _session_dirs(subject_dir):
+        whole_files.extend(sorted(session_dir.glob("*whole_session*.csv")))
     streams: List[Tuple[str, pd.DataFrame]] = []
     for whole_file in whole_files:
         try:
@@ -580,7 +598,7 @@ def evaluate(
 
     subjects = [p.name for p in _subject_dirs(data_dir)]
     if not include_actions:
-        action_names = sorted({p.name for subject in _subject_dirs(data_dir) for p in subject.iterdir() if p.is_dir()})
+        action_names = sorted({p.name for subject in _subject_dirs(data_dir) for sess in _session_dirs(subject) for p in sess.iterdir() if p.is_dir()})
         include_actions = [a for a in action_names if "rest" not in a]
 
     metrics_rows: List[Dict[str, object]] = []

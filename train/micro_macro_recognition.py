@@ -22,6 +22,18 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 import yaml
 
+
+def _make_grad_scaler(use_amp: bool):
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        return torch.amp.GradScaler("cuda", enabled=use_amp)
+    return torch.cuda.amp.GradScaler(enabled=use_amp)
+
+
+def _autocast_context(use_amp: bool):
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        return torch.amp.autocast("cuda", enabled=use_amp)
+    return torch.cuda.amp.autocast(enabled=use_amp)
+
 from models.ds_ms_tcn import DSMSTCN, DSMSTCNConfig, ds_ms_tcn_loss
 from evaluation.reporting import primary_metric_table, write_run_manifest
 from preprocessing.dtw_micro_adapter import (
@@ -67,14 +79,31 @@ class MicroMacroConfig:
     alpha: float = 1.0
     beta: float = 0.15
     tmse_threshold: float = 4.0
+    micro_tmse_weight: float = 0.0
+    micro_tmse_threshold: float = 4.0
+    use_dual_micro_head: bool = False
+    use_semantic_for_macro: bool = False
+    semantic_micro_label_mode: str = "action_phase"
+    semantic_alpha: float = 0.0
+    semantic_phase_fusion_weight: float = 0.0
+    semantic_micro_class_weights: List[float] = field(default_factory=list)
     num_macro_stages: int = 4
+    micro_label_mode: str = "phase"
+    stage1_pretrain_epochs: int = 0
     max_phase_gap_samples: int = 0
     min_phase_samples: int = 3
     min_rep_duration_seconds: float = 0.0
     min_rep_confidence: float = 0.0
+    micro_smoothing_window: int = 1
+    micro_class_weights: List[float] = field(default_factory=list)
+    micro_decoder: str = "greedy"
+    micro_decoder_switch_penalty: float = 0.0
+    micro_decoder_invalid_transition_penalty: float = 3.0
+    micro_decoder_min_run_samples: int = 0
     resample_to_window_rate: bool = False
     plot_max_streams: int = 24
     train_on_modes: List[str] = field(default_factory=lambda: ["sets", "whole"])
+    rep_count_weight: float = 0.0
 
 
 @dataclass
@@ -89,6 +118,160 @@ class TrainConfig:
     device: str = "auto"
     pin_memory: bool | str = "auto"
     amp: bool = True
+
+
+def _micro_classes_for_mode(actions: Sequence[str], micro_label_mode: str) -> List[str]:
+    mode = str(micro_label_mode).lower()
+    if mode == "phase":
+        return list(MICRO_LABELS)
+    if mode == "action_phase":
+        classes = [OTHER_LABEL]
+        for action in actions:
+            action_s = str(action)
+            if action_s == OTHER_LABEL:
+                continue
+            classes.append(f"{action_s}::{CONCENTRIC_LABEL}")
+            classes.append(f"{action_s}::{ECCENTRIC_LABEL}")
+        return classes
+    raise ValueError(f"Unsupported micro_label_mode: {micro_label_mode}")
+
+
+def _phase_from_micro_label(label: object) -> str:
+    value = str(label)
+    if value == CONCENTRIC_LABEL or value.endswith(f"::{CONCENTRIC_LABEL}"):
+        return CONCENTRIC_LABEL
+    if value == ECCENTRIC_LABEL or value.endswith(f"::{ECCENTRIC_LABEL}"):
+        return ECCENTRIC_LABEL
+    return OTHER_LABEL
+
+
+def _micro_labels_for_sequence(phases: Sequence[object], actions: Sequence[object], micro_label_mode: str) -> np.ndarray:
+    phase_labels = micro_labels_from_phase(phases)
+    mode = str(micro_label_mode).lower()
+    if mode == "phase":
+        return phase_labels
+    if mode != "action_phase":
+        raise ValueError(f"Unsupported micro_label_mode: {micro_label_mode}")
+    out = []
+    for phase_label, action in zip(phase_labels, actions):
+        if str(phase_label) == OTHER_LABEL or str(action) == OTHER_LABEL:
+            out.append(OTHER_LABEL)
+        else:
+            out.append(f"{str(action)}::{str(phase_label)}")
+    return np.asarray(out, dtype=object)
+
+
+def _collapse_micro_probs_to_phase(micro_probs: np.ndarray, micro_classes: Sequence[str]) -> np.ndarray:
+    if micro_probs.ndim != 2:
+        raise ValueError(f"Expected micro_probs with shape [T, C], got {micro_probs.shape}")
+    phase_probs = np.zeros((micro_probs.shape[0], len(MICRO_LABELS)), dtype=np.float32)
+    for cls_idx, label in enumerate(micro_classes):
+        phase_idx = MICRO_LABELS.index(_phase_from_micro_label(label))
+        phase_probs[:, phase_idx] += micro_probs[:, cls_idx]
+    denom = np.maximum(np.sum(phase_probs, axis=1, keepdims=True), 1e-8)
+    return phase_probs / denom
+
+
+def _collapse_semantic_probs_to_phase(semantic_probs: np.ndarray, semantic_classes: Sequence[str]) -> np.ndarray:
+    if semantic_probs.ndim != 2:
+        raise ValueError(f"Expected semantic_probs with shape [T, C], got {semantic_probs.shape}")
+    phase_probs = np.zeros((semantic_probs.shape[0], len(MICRO_LABELS)), dtype=np.float32)
+    for cls_idx, label in enumerate(semantic_classes):
+        phase_idx = MICRO_LABELS.index(_phase_from_micro_label(label))
+        phase_probs[:, phase_idx] += semantic_probs[:, cls_idx]
+    denom = np.maximum(np.sum(phase_probs, axis=1, keepdims=True), 1e-8)
+    return phase_probs / denom
+
+
+def _blend_phase_probs(base_phase_probs: np.ndarray, semantic_phase_probs: np.ndarray | None, fusion_weight: float) -> np.ndarray:
+    weight = float(fusion_weight)
+    if semantic_phase_probs is None or weight <= 0.0:
+        return base_phase_probs
+    weight = min(max(weight, 0.0), 1.0)
+    blended = (1.0 - weight) * base_phase_probs + weight * semantic_phase_probs
+    denom = np.maximum(np.sum(blended, axis=1, keepdims=True), 1e-8)
+    return blended / denom
+
+
+def _rewrite_short_runs(labels: Sequence[str], probabilities: np.ndarray, min_run_samples: int) -> List[str]:
+    if int(min_run_samples) <= 1:
+        return [str(x) for x in labels]
+    out = [str(x) for x in labels]
+    n = len(out)
+    if n == 0:
+        return out
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and out[j] == out[i]:
+            j += 1
+        if j - i < int(min_run_samples):
+            left = out[i - 1] if i > 0 else None
+            right = out[j] if j < n else None
+            replacement = left or right or out[i]
+            if left is not None and right is not None and left != right:
+                left_idx = MICRO_LABELS.index(left)
+                right_idx = MICRO_LABELS.index(right)
+                left_score = float(np.mean(probabilities[i:j, left_idx]))
+                right_score = float(np.mean(probabilities[i:j, right_idx]))
+                replacement = left if left_score >= right_score else right
+            for k in range(i, j):
+                out[k] = replacement
+        i = j
+    return out
+
+
+def _decode_phase_labels(micro_probs: np.ndarray, mm_cfg: MicroMacroConfig) -> List[str]:
+    decoder = str(mm_cfg.micro_decoder).lower()
+    if decoder not in {"greedy", "viterbi"}:
+        raise ValueError(f"Unsupported micro_decoder: {mm_cfg.micro_decoder}")
+    log_probs = np.log(np.clip(micro_probs.astype(np.float64), 1e-8, 1.0))
+    if decoder == "greedy":
+        states = np.argmax(log_probs, axis=1)
+    else:
+        switch_penalty = float(mm_cfg.micro_decoder_switch_penalty)
+        invalid_penalty = float(mm_cfg.micro_decoder_invalid_transition_penalty)
+        transition_scores = np.full((len(MICRO_LABELS), len(MICRO_LABELS)), -switch_penalty, dtype=np.float64)
+        np.fill_diagonal(transition_scores, 0.0)
+        other_idx = MICRO_LABELS.index(OTHER_LABEL)
+        concentric_idx = MICRO_LABELS.index(CONCENTRIC_LABEL)
+        eccentric_idx = MICRO_LABELS.index(ECCENTRIC_LABEL)
+        transition_scores[other_idx, eccentric_idx] = -invalid_penalty
+        transition_scores[concentric_idx, other_idx] = -switch_penalty
+        transition_scores[concentric_idx, eccentric_idx] = 0.0
+        transition_scores[eccentric_idx, concentric_idx] = 0.0
+        transition_scores[eccentric_idx, other_idx] = -switch_penalty
+        transition_scores[eccentric_idx, concentric_idx] = 0.0
+        transition_scores[concentric_idx, concentric_idx] = 0.0
+        transition_scores[eccentric_idx, eccentric_idx] = 0.0
+        scores = np.full_like(log_probs, -np.inf)
+        back = np.zeros((len(log_probs), len(MICRO_LABELS)), dtype=np.int64)
+        scores[0] = log_probs[0]
+        for t in range(1, len(log_probs)):
+            prev = scores[t - 1][:, None] + transition_scores
+            back[t] = np.argmax(prev, axis=0)
+            scores[t] = log_probs[t] + np.max(prev, axis=0)
+        states = np.zeros(len(log_probs), dtype=np.int64)
+        states[-1] = int(np.argmax(scores[-1]))
+        for t in range(len(log_probs) - 1, 0, -1):
+            states[t - 1] = back[t, states[t]]
+    labels = [MICRO_LABELS[int(idx)] for idx in states]
+    min_run = int(mm_cfg.micro_decoder_min_run_samples or 0)
+    return _rewrite_short_runs(labels, micro_probs, min_run)
+
+
+def _session_time_bounds(df: pd.DataFrame, time_column: str) -> Tuple[pd.Timestamp | float, pd.Timestamp | float]:
+    if "pc_time" in df.columns:
+        parsed = pd.to_datetime(df["pc_time"], errors="coerce")
+        parsed = parsed.dropna()
+        if not parsed.empty:
+            return parsed.iloc[0], parsed.iloc[-1]
+    if time_column in df.columns and len(df):
+        start = float(df[time_column].iloc[0])
+        end = float(df[time_column].iloc[-1])
+        return start, end
+    fallback = float(len(df))
+    return fallback, fallback
 
 
 def _resolve_device(device_setting: str) -> torch.device:
@@ -123,28 +306,63 @@ def _resolve_pin_memory(pin_memory: bool | str, device: torch.device) -> bool:
     return bool(pin_memory)
 
 
+def _count_reps_in_slice(micro_labels: np.ndarray, micro_classes: Sequence[str]) -> int:
+    """Count concentric->eccentric pairs in a slice of micro labels."""
+    con_idx = {str(c): i for i, c in enumerate(micro_classes)}.get("concentric", -1)
+    ecc_idx = {str(c): i for i, c in enumerate(micro_classes)}.get("eccentric", -1)
+    if con_idx < 0 or ecc_idx < 0:
+        return 0
+    # Count transitions from concentric to eccentric
+    valid = micro_labels[micro_labels >= 0]
+    if len(valid) < 2:
+        return 0
+    transitions = (valid[:-1] == con_idx) & (valid[1:] == ecc_idx)
+    return int(transitions.sum())
+
+
 class SequenceSliceDataset(Dataset):
     def __init__(
         self,
         sequences: Sequence[pd.DataFrame],
         imu_columns: Sequence[str],
+        micro_classes: Sequence[str],
         macro_classes: Sequence[str],
         slice_len: int,
         stride_len: int,
+        micro_label_mode: str = "phase",
+        semantic_micro_classes: Sequence[str] | None = None,
+        semantic_micro_label_mode: str = "action_phase",
         use_gt_micro_probs: bool = False,
     ) -> None:
-        self.items: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+        self.items: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
         self.imu_columns = list(imu_columns)
         self.macro_to_idx = {str(c): i for i, c in enumerate(macro_classes)}
-        self.micro_to_idx = {label: i for i, label in enumerate(MICRO_LABELS)}
+        self.micro_classes = [str(x) for x in micro_classes]
+        self.micro_to_idx = {label: i for i, label in enumerate(self.micro_classes)}
+        self.semantic_micro_classes = [str(x) for x in (semantic_micro_classes or [])]
+        self.semantic_micro_to_idx = {label: i for i, label in enumerate(self.semantic_micro_classes)}
         self.slice_len = int(slice_len)
+        self.micro_label_mode = str(micro_label_mode)
+        self.semantic_micro_label_mode = str(semantic_micro_label_mode)
         self.use_gt_micro_probs = bool(use_gt_micro_probs)
 
         for seq in sequences:
             if "phase" not in seq.columns or "action_type" not in seq.columns:
                 continue
             x = seq[self.imu_columns].to_numpy(dtype=np.float32)
-            micro_labels = micro_labels_from_phase(seq["phase"].to_numpy())
+            micro_labels = _micro_labels_for_sequence(
+                seq["phase"].to_numpy(),
+                seq["action_type"].astype(str).to_numpy(),
+                self.micro_label_mode,
+            )
+            semantic_micro_idx = None
+            if self.semantic_micro_classes:
+                semantic_micro_labels = _micro_labels_for_sequence(
+                    seq["phase"].to_numpy(),
+                    seq["action_type"].astype(str).to_numpy(),
+                    self.semantic_micro_label_mode,
+                )
+                semantic_micro_idx = np.asarray([self.semantic_micro_to_idx[str(v)] for v in semantic_micro_labels], dtype=np.int64)
             macro_labels = macro_labels_from_action(seq["action_type"].astype(str).to_numpy(), micro_labels)
             micro_idx = np.asarray([self.micro_to_idx[str(v)] for v in micro_labels], dtype=np.int64)
             macro_idx = np.asarray([self.macro_to_idx.get(str(v), self.macro_to_idx[OTHER_LABEL]) for v in macro_labels], dtype=np.int64)
@@ -154,33 +372,67 @@ class SequenceSliceDataset(Dataset):
                 starts.append(max(0, n - self.slice_len))
             for start in sorted(set(starts)):
                 end = min(n, start + self.slice_len)
-                self.items.append(self._make_item(x[start:end], micro_idx[start:end], macro_idx[start:end]))
+                semantic_slice = semantic_micro_idx[start:end] if semantic_micro_idx is not None else None
+                rep_count = _count_reps_in_slice(micro_idx[start:end], self.micro_classes)
+                self.items.append(self._make_item(x[start:end], micro_idx[start:end], macro_idx[start:end], semantic_slice, rep_count))
 
-    def _make_item(self, x: np.ndarray, micro: np.ndarray, macro: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def _make_item(
+        self,
+        x: np.ndarray,
+        micro: np.ndarray,
+        macro: np.ndarray,
+        semantic_micro: np.ndarray | None,
+        rep_count: int,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         valid = len(x)
         if valid < self.slice_len:
             pad = self.slice_len - valid
             x = np.pad(x, ((0, pad), (0, 0)), mode="constant")
             micro = np.pad(micro, (0, pad), mode="constant", constant_values=-100)
             macro = np.pad(macro, (0, pad), mode="constant", constant_values=-100)
-        gt_micro_probs = np.zeros((self.slice_len, len(MICRO_LABELS)), dtype=np.float32)
+            if semantic_micro is not None:
+                semantic_micro = np.pad(semantic_micro, (0, pad), mode="constant", constant_values=-100)
+        gt_micro_probs = np.zeros((self.slice_len, len(self.micro_classes)), dtype=np.float32)
         for i, idx in enumerate(micro):
             if idx >= 0:
                 gt_micro_probs[i, int(idx)] = 1.0
             else:
-                gt_micro_probs[i, MICRO_LABELS.index(OTHER_LABEL)] = 1.0
-        return x.astype(np.float32), micro.astype(np.int64), macro.astype(np.int64), gt_micro_probs
+                gt_micro_probs[i, self.micro_to_idx[OTHER_LABEL]] = 1.0
+        if self.semantic_micro_classes:
+            semantic_target = semantic_micro.astype(np.int64) if semantic_micro is not None else np.full(self.slice_len, -100, dtype=np.int64)
+            gt_semantic_probs = np.zeros((self.slice_len, len(self.semantic_micro_classes)), dtype=np.float32)
+            semantic_other_idx = self.semantic_micro_to_idx.get(OTHER_LABEL, 0)
+            for i, idx in enumerate(semantic_target):
+                if idx >= 0:
+                    gt_semantic_probs[i, int(idx)] = 1.0
+                else:
+                    gt_semantic_probs[i, semantic_other_idx] = 1.0
+        else:
+            semantic_target = np.full(self.slice_len, -100, dtype=np.int64)
+            gt_semantic_probs = np.zeros((self.slice_len, 1), dtype=np.float32)
+        return (
+            x.astype(np.float32),
+            micro.astype(np.int64),
+            macro.astype(np.int64),
+            gt_micro_probs,
+            semantic_target,
+            gt_semantic_probs,
+            np.array([rep_count], dtype=np.float32),
+        )
 
     def __len__(self) -> int:
         return len(self.items)
 
     def __getitem__(self, idx: int):
-        x, micro, macro, gt_micro_probs = self.items[idx]
+        x, micro, macro, gt_micro_probs, semantic_micro, gt_semantic_probs, rep_count = self.items[idx]
         return (
             torch.from_numpy(x),
             torch.from_numpy(micro),
             torch.from_numpy(macro),
             torch.from_numpy(gt_micro_probs),
+            torch.from_numpy(semantic_micro),
+            torch.from_numpy(gt_semantic_probs),
+            torch.from_numpy(rep_count),
         )
 
 
@@ -201,6 +453,11 @@ def _subject_dirs(data_dir: Path) -> List[Path]:
     return [p for p in sorted(data_dir.iterdir()) if p.is_dir()]
 
 
+def _session_dirs(subject_dir: Path) -> List[Path]:
+    """Return session subdirectories within a subject folder."""
+    return [p for p in sorted(subject_dir.iterdir()) if p.is_dir()]
+
+
 def _load_config(path: Path) -> Dict:
     return yaml.safe_load(path.read_text(encoding="utf-8"))
 
@@ -208,8 +465,30 @@ def _load_config(path: Path) -> Dict:
 def _available_actions(data_dir: Path, include_actions: Sequence[str] | None) -> List[str]:
     if include_actions:
         return [str(a) for a in include_actions]
-    actions = sorted({p.name for subj in _subject_dirs(data_dir) for p in subj.iterdir() if p.is_dir() and "rest" not in p.name})
+    actions = sorted({
+        p.name
+        for subj in _subject_dirs(data_dir)
+        for sess in _session_dirs(subj)
+        for p in sess.iterdir()
+        if p.is_dir() and "rest" not in p.name
+    })
     return actions
+
+
+def _subject_alias_map(raw_cfg: Dict) -> Dict[str, str]:
+    data_cfg = raw_cfg.get("data", {}) or {}
+    aliases = dict(data_cfg.get("subject_aliases", {}) or {})
+    return {str(k): str(v) for k, v in aliases.items()}
+
+
+def _split_subject_name(subject: str, alias_map: Dict[str, str]) -> str:
+    subject_s = str(subject)
+    return str(alias_map.get(subject_s, subject_s))
+
+
+def _is_all_subjects_mode(test_subject: object) -> bool:
+    value = str(test_subject or "").strip().lower()
+    return value in {"all", "__all__", "*"}
 
 
 def _load_set_sequences(
@@ -217,36 +496,39 @@ def _load_set_sequences(
     subject: str,
     action: str,
     exclude_patterns: Sequence[str],
+    alias_map: Dict[str, str] | None = None,
 ) -> List[Tuple[str, pd.DataFrame]]:
-    action_dir = data_dir / subject / action
-    if not action_dir.exists():
-        return []
+    subject_dir = data_dir / subject
     streams: List[Tuple[str, pd.DataFrame]] = []
-    for set_dir in sorted(action_dir.iterdir()):
-        if not set_dir.is_dir() or not set_dir.name.startswith("set"):
+    for session_dir in _session_dirs(subject_dir):
+        session = session_dir.name
+        action_dir = session_dir / action
+        if not action_dir.exists():
             continue
-        if _matches_any(set_dir, data_dir, exclude_patterns):
-            continue
-        frames = []
-        for csv_path in sorted(set_dir.glob("*.csv"), key=_natural_key):
-            if _matches_any(csv_path, data_dir, exclude_patterns):
+        for set_dir in sorted(action_dir.iterdir()):
+            if not set_dir.is_dir() or not set_dir.name.startswith("set"):
                 continue
-            try:
-                df = pd.read_csv(csv_path)
-            except Exception:
+            if _matches_any(set_dir, data_dir, exclude_patterns):
                 continue
-            if "phase" not in df.columns:
-                continue
-            df = df.copy()
-            if "action_type" not in df.columns:
-                df["action_type"] = action
-            if "subject_id" not in df.columns:
+            frames = []
+            for csv_path in sorted(set_dir.glob("*.csv"), key=_natural_key):
+                if _matches_any(csv_path, data_dir, exclude_patterns):
+                    continue
+                try:
+                    df = pd.read_csv(csv_path)
+                except Exception:
+                    continue
+                if "phase" not in df.columns:
+                    continue
+                df = df.copy()
+                if "action_type" not in df.columns:
+                    df["action_type"] = action
                 df["subject_id"] = subject
-            df["_split_subject"] = subject
-            df["_source_file"] = csv_path.name
-            frames.append(df)
-        if frames:
-            streams.append((f"{subject}/{action}/{set_dir.name}", pd.concat(frames, ignore_index=True)))
+                df["_split_subject"] = subject
+                df["_source_file"] = csv_path.name
+                frames.append(df)
+            if frames:
+                streams.append((f"{subject}/{session}/{action}/{set_dir.name}", pd.concat(frames, ignore_index=True)))
     return streams
 
 
@@ -254,29 +536,133 @@ def _load_whole_sequences(
     data_dir: Path,
     subject: str,
     include_actions: Sequence[str],
+    alias_map: Dict[str, str] | None = None,
 ) -> List[Tuple[str, pd.DataFrame]]:
+    subject_dir = data_dir / subject
     streams = []
     allowed = set(str(a) for a in include_actions)
-    for csv_path in sorted((data_dir / subject).glob("*whole_session*.csv")):
-        try:
-            df = pd.read_csv(csv_path)
-        except Exception:
-            continue
-        if not {"phase", "action_type"}.issubset(df.columns):
-            continue
-        df = df.copy()
-        if "subject_id" not in df.columns:
+    for session_dir in _session_dirs(subject_dir):
+        session = session_dir.name
+        for csv_path in sorted(session_dir.glob("*whole_session*.csv")):
+            try:
+                df = pd.read_csv(csv_path)
+            except Exception:
+                continue
+            if not {"phase", "action_type"}.issubset(df.columns):
+                continue
+            df = df.copy()
             df["subject_id"] = subject
-        df["_split_subject"] = subject
-        df.loc[~df["action_type"].astype(str).isin(allowed), "action_type"] = OTHER_LABEL
-        streams.append((f"{subject}/{csv_path.stem}", df))
+            df["_split_subject"] = subject
+            df.loc[~df["action_type"].astype(str).isin(allowed), "action_type"] = OTHER_LABEL
+            streams.append((f"{subject}/{session}/{csv_path.stem}", df))
     return streams
+
+
+def _read_fragment_csv(
+    csv_path: Path,
+    subject: str,
+    action_type: str,
+    alias_map: Dict[str, str] | None = None,
+) -> pd.DataFrame | None:
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception:
+        return None
+    if "phase" not in df.columns or df.empty:
+        return None
+    df = df.copy()
+    df["action_type"] = str(action_type)
+    df["subject_id"] = subject
+    df["_split_subject"] = subject
+    df["_source_file"] = csv_path.name
+    return df
+
+
+def _load_synthetic_whole_sequences(
+    data_dir: Path,
+    subject: str,
+    include_actions: Sequence[str],
+    exclude_patterns: Sequence[str],
+    alias_map: Dict[str, str] | None = None,
+    time_column: str = "sensor_ts",
+    gap_seconds: float = 600.0,
+) -> List[Tuple[str, pd.DataFrame]]:
+    subject_dir = data_dir / subject
+    if not subject_dir.exists():
+        return []
+    allowed = set(str(a) for a in include_actions)
+    all_streams: List[Tuple[str, pd.DataFrame]] = []
+    for session_dir in _session_dirs(subject_dir):
+        session = session_dir.name
+        fragments: List[Tuple[pd.Timestamp | float, pd.Timestamp | float, Path, pd.DataFrame]] = []
+        for action in sorted(allowed):
+            action_dir = session_dir / action
+            if not action_dir.exists():
+                continue
+            for child in sorted(action_dir.iterdir()):
+                if not child.is_dir():
+                    continue
+                child_name = child.name
+                if child_name.startswith("set"):
+                    if _matches_any(child, data_dir, exclude_patterns):
+                        continue
+                    action_type = action
+                elif child_name.startswith("rest_after_set"):
+                    action_type = OTHER_LABEL
+                else:
+                    continue
+                for csv_path in sorted(child.glob("*.csv"), key=_natural_key):
+                    if action_type != OTHER_LABEL and _matches_any(csv_path, data_dir, exclude_patterns):
+                        continue
+                    df = _read_fragment_csv(csv_path, subject, action_type)
+                    if df is None:
+                        continue
+                    start, end = _session_time_bounds(df, time_column)
+                    fragments.append((start, end, csv_path, df))
+
+        big_rest_dir = session_dir / "big_rest"
+        if big_rest_dir.exists():
+            for csv_path in sorted(big_rest_dir.glob("session*/*.csv"), key=_natural_key):
+                df = _read_fragment_csv(csv_path, subject, OTHER_LABEL)
+                if df is None:
+                    continue
+                start, end = _session_time_bounds(df, time_column)
+                fragments.append((start, end, csv_path, df))
+
+        if not fragments:
+            continue
+
+        fragments.sort(key=lambda item: item[0])
+        grouped: List[List[pd.DataFrame]] = []
+        current_group: List[pd.DataFrame] = []
+        prev_end = None
+        for start, end, _csv_path, df in fragments:
+            if prev_end is not None:
+                try:
+                    delta_seconds = float((start - prev_end).total_seconds())
+                except AttributeError:
+                    delta_seconds = float(start) - float(prev_end)
+                if delta_seconds > float(gap_seconds) and current_group:
+                    grouped.append(current_group)
+                    current_group = []
+            current_group.append(df)
+            prev_end = end
+        if current_group:
+            grouped.append(current_group)
+
+        for idx, group in enumerate(grouped):
+            merged = pd.concat(group, ignore_index=True)
+            all_streams.append((f"{subject}/{session}/synthetic_whole_session_{idx}", merged))
+    return all_streams
 
 
 def _load_streams(raw_cfg: Dict, modes: Sequence[str]) -> Tuple[List[Tuple[str, pd.DataFrame]], List[str], List[str]]:
     data_cfg = raw_cfg.get("data", {}) or {}
     data_dir = Path(data_cfg.get("data_dir", "./datasets/raw_data"))
     exclude_patterns = list(data_cfg.get("exclude_patterns") or [])
+    time_column = str((raw_cfg.get("feature", {}) or {}).get("time_column", "sensor_ts"))
+    synthetic_whole_streams = bool(data_cfg.get("synthetic_whole_streams", False))
+    synthetic_whole_gap_seconds = float(data_cfg.get("synthetic_whole_gap_seconds", 600.0))
     actions = _available_actions(data_dir, data_cfg.get("include_actions"))
     subjects = [p.name for p in _subject_dirs(data_dir)]
     streams: List[Tuple[str, pd.DataFrame]] = []
@@ -285,7 +671,20 @@ def _load_streams(raw_cfg: Dict, modes: Sequence[str]) -> Tuple[List[Tuple[str, 
             for action in actions:
                 streams.extend(_load_set_sequences(data_dir, subject, action, exclude_patterns))
         if "whole" in modes:
-            streams.extend(_load_whole_sequences(data_dir, subject, actions))
+            native_whole = _load_whole_sequences(data_dir, subject, actions)
+            if native_whole:
+                streams.extend(native_whole)
+            if synthetic_whole_streams:
+                streams.extend(
+                    _load_synthetic_whole_sequences(
+                        data_dir,
+                        subject,
+                        actions,
+                        exclude_patterns,
+                        time_column=time_column,
+                        gap_seconds=synthetic_whole_gap_seconds,
+                    )
+                )
     return streams, subjects, actions
 
 
@@ -345,6 +744,7 @@ def _predict_full_sequence(
     imu_columns: Sequence[str],
     device: torch.device,
     external_micro: np.ndarray | None = None,
+    micro_smoothing_window: int = 1,
 ) -> Dict[str, np.ndarray]:
     model.eval()
     x = torch.from_numpy(df[list(imu_columns)].to_numpy(dtype=np.float32))[None, :, :].to(device)
@@ -352,10 +752,32 @@ def _predict_full_sequence(
     with torch.no_grad():
         out = model(x, external_micro_probs=ext)
     final_macro = model.final_macro_logits(out)
-    return {
-        "micro_probs": out["micro_probs"].detach().cpu().numpy()[0],
+    micro_probs = out["micro_probs"].detach().cpu().numpy()[0]
+    smooth_window = max(1, int(micro_smoothing_window))
+    if smooth_window > 1:
+        smoothed = np.zeros_like(micro_probs)
+        csum = np.cumsum(micro_probs, axis=0)
+        for i in range(len(micro_probs)):
+            start = max(0, i - smooth_window + 1)
+            total = csum[i] - (csum[start - 1] if start > 0 else 0.0)
+            smoothed[i] = total / float(i - start + 1)
+        micro_probs = smoothed
+    result = {
+        "micro_probs": micro_probs,
         "macro_probs": torch.softmax(final_macro, dim=-1).detach().cpu().numpy()[0],
     }
+    if "semantic_micro_probs" in out:
+        semantic_probs = out["semantic_micro_probs"].detach().cpu().numpy()[0]
+        if smooth_window > 1:
+            smoothed = np.zeros_like(semantic_probs)
+            csum = np.cumsum(semantic_probs, axis=0)
+            for i in range(len(semantic_probs)):
+                start = max(0, i - smooth_window + 1)
+                total = csum[i] - (csum[start - 1] if start > 0 else 0.0)
+                smoothed[i] = total / float(i - start + 1)
+            semantic_probs = smoothed
+        result["semantic_micro_probs"] = semantic_probs
+    return result
 
 
 def _median_sample_rate(streams: Sequence[Tuple[str, pd.DataFrame]], fallback_hz: float) -> float:
@@ -410,41 +832,86 @@ def _train_model(
     loader: DataLoader,
     cfg: TrainConfig,
     mm_cfg: MicroMacroConfig,
+    micro_classes: Sequence[str],
+    semantic_micro_classes: Sequence[str],
     use_gt_micro_probs: bool,
 ) -> None:
     device = torch.device(cfg.device)
     model.to(device)
     use_amp = bool(cfg.amp) and device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-    optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg.lr), weight_decay=float(cfg.weight_decay))
-    for epoch in range(1, int(cfg.epochs) + 1):
-        model.train()
-        total = 0.0
-        count = 0
-        for x, micro, macro, gt_micro_probs in loader:
-            non_blocking = device.type == "cuda"
-            x = x.to(device, non_blocking=non_blocking)
-            micro = micro.to(device, non_blocking=non_blocking)
-            macro = macro.to(device, non_blocking=non_blocking)
-            gt_micro_probs = gt_micro_probs.to(device, non_blocking=non_blocking)
-            optimizer.zero_grad()
-            with torch.amp.autocast("cuda", enabled=use_amp):
-                out = model(x, external_micro_probs=gt_micro_probs if use_gt_micro_probs else None)
-                losses = ds_ms_tcn_loss(
-                    out,
-                    micro,
-                    macro,
-                    alpha=mm_cfg.alpha,
-                    beta=mm_cfg.beta,
-                    tmse_threshold=mm_cfg.tmse_threshold,
-                    include_micro_loss=not use_gt_micro_probs,
-                )
-            scaler.scale(losses["loss"]).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            total += float(losses["loss"].detach().cpu()) * len(x)
-            count += len(x)
-        print(f"[INFO] epoch={epoch:03d} loss={total / max(1, count):.4f}")
+    micro_class_weight_tensor = None
+    if mm_cfg.micro_class_weights:
+        if len(mm_cfg.micro_class_weights) != len(micro_classes):
+            raise ValueError(
+                f"micro_class_weights must have {len(micro_classes)} entries for configured micro classes, got {len(mm_cfg.micro_class_weights)}"
+            )
+        micro_class_weight_tensor = torch.tensor(mm_cfg.micro_class_weights, dtype=torch.float32, device=device)
+    semantic_class_weight_tensor = None
+    if mm_cfg.semantic_micro_class_weights:
+        if len(mm_cfg.semantic_micro_class_weights) != len(semantic_micro_classes):
+            raise ValueError(
+                f"semantic_micro_class_weights must have {len(semantic_micro_classes)} entries for configured semantic micro classes, got {len(mm_cfg.semantic_micro_class_weights)}"
+            )
+        semantic_class_weight_tensor = torch.tensor(mm_cfg.semantic_micro_class_weights, dtype=torch.float32, device=device)
+
+    def _run_phase(epochs: int, micro_only: bool, phase_name: str) -> None:
+        if epochs <= 0:
+            return
+        scaler = _make_grad_scaler(use_amp)
+        optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg.lr), weight_decay=float(cfg.weight_decay))
+        for epoch in range(1, int(epochs) + 1):
+            model.train()
+            total = 0.0
+            count = 0
+            for batch in loader:
+                x, micro, macro, gt_micro_probs, semantic_micro, gt_semantic_probs = batch[:6]
+                rep_count_target = batch[6] if len(batch) > 6 else None
+                non_blocking = device.type == "cuda"
+                x = x.to(device, non_blocking=non_blocking)
+                micro = micro.to(device, non_blocking=non_blocking)
+                macro = macro.to(device, non_blocking=non_blocking)
+                gt_micro_probs = gt_micro_probs.to(device, non_blocking=non_blocking)
+                semantic_micro = semantic_micro.to(device, non_blocking=non_blocking)
+                gt_semantic_probs = gt_semantic_probs.to(device, non_blocking=non_blocking)
+                if rep_count_target is not None:
+                    rep_count_target = rep_count_target.to(device, non_blocking=non_blocking)
+                optimizer.zero_grad()
+                with _autocast_context(use_amp):
+                    out = model(
+                        x,
+                        external_micro_probs=gt_micro_probs if use_gt_micro_probs else None,
+                        external_semantic_micro_probs=gt_semantic_probs if use_gt_micro_probs and semantic_micro_classes else None,
+                    )
+                    losses = ds_ms_tcn_loss(
+                        out,
+                        micro,
+                        macro,
+                        alpha=mm_cfg.alpha,
+                        beta=mm_cfg.beta,
+                        tmse_threshold=mm_cfg.tmse_threshold,
+                        include_micro_loss=not use_gt_micro_probs,
+                        include_macro_loss=not micro_only,
+                        micro_class_weights=micro_class_weight_tensor,
+                        micro_beta=mm_cfg.micro_tmse_weight,
+                        micro_tmse_threshold=mm_cfg.micro_tmse_threshold,
+                        semantic_target=semantic_micro if semantic_micro_classes else None,
+                        semantic_alpha=mm_cfg.semantic_alpha,
+                        semantic_class_weights=semantic_class_weight_tensor,
+                        rep_count_target=rep_count_target,
+                        rep_count_weight=mm_cfg.rep_count_weight,
+                    )
+                scaler.scale(losses["loss"]).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                total += float(losses["loss"].detach().cpu()) * len(x)
+                count += len(x)
+            print(
+                f"[INFO] phase={phase_name} epoch={epoch:03d}/{epochs:03d} loss={total / max(1, count):.4f}",
+                flush=True,
+            )
+
+    _run_phase(int(mm_cfg.stage1_pretrain_epochs), micro_only=True, phase_name="stage1_pretrain")
+    _run_phase(int(cfg.epochs), micro_only=False, phase_name="joint")
 
 
 def _evaluate_streams(
@@ -453,6 +920,8 @@ def _evaluate_streams(
     train_sequences_for_dtw: Sequence[pd.DataFrame],
     imu_columns: Sequence[str],
     macro_classes: Sequence[str],
+    micro_classes: Sequence[str],
+    semantic_micro_classes: Sequence[str],
     micro_source: str,
     mm_cfg: MicroMacroConfig,
     dtw_cfg: DTWMicroConfig,
@@ -496,14 +965,45 @@ def _evaluate_streams(
                 flush=True,
             )
             external = dtw_runs_to_micro_scores(len(df), dtw_runs)
-            pred = _predict_full_sequence(model, df, imu_columns, device, external_micro=external)
+            pred = _predict_full_sequence(
+                model,
+                df,
+                imu_columns,
+                device,
+                external_micro=external,
+                micro_smoothing_window=int(mm_cfg.micro_smoothing_window),
+            )
         else:
             print(f"[INFO] TCN eval {stream_idx}/{len(streams)} stream={stream_id} samples={len(df)}", flush=True)
-            pred = _predict_full_sequence(model, df, imu_columns, device)
-        micro_probs = pred["micro_probs"]
+            pred = _predict_full_sequence(
+                model,
+                df,
+                imu_columns,
+                device,
+                micro_smoothing_window=int(mm_cfg.micro_smoothing_window),
+            )
+        raw_micro_probs = pred["micro_probs"]
+        semantic_raw_micro_probs = pred.get("semantic_micro_probs")
+        micro_probs = _collapse_micro_probs_to_phase(raw_micro_probs, micro_classes)
+        if semantic_raw_micro_probs is not None and semantic_micro_classes:
+            micro_probs = _blend_phase_probs(
+                micro_probs,
+                _collapse_semantic_probs_to_phase(semantic_raw_micro_probs, semantic_micro_classes),
+                mm_cfg.semantic_phase_fusion_weight,
+            )
         macro_probs = pred["macro_probs"]
-        pred_micro_labels = [MICRO_LABELS[int(i)] for i in np.argmax(micro_probs, axis=1)]
+        pred_micro_labels = _decode_phase_labels(micro_probs, mm_cfg)
         gt_micro_labels = micro_labels_from_phase(df["phase"].to_numpy())
+        semantic_gt_micro_labels = _micro_labels_for_sequence(
+            df["phase"].to_numpy(),
+            df["action_type"].astype(str).to_numpy() if "action_type" in df.columns else [OTHER_LABEL] * len(df),
+            mm_cfg.semantic_micro_label_mode if mm_cfg.use_dual_micro_head else mm_cfg.micro_label_mode,
+        )
+        semantic_pred_micro_labels = None
+        if semantic_raw_micro_probs is not None and semantic_micro_classes:
+            semantic_pred_micro_labels = np.asarray([semantic_micro_classes[int(i)] for i in np.argmax(semantic_raw_micro_probs, axis=1)], dtype=object)
+        elif str(mm_cfg.micro_label_mode).lower() != "phase":
+            semantic_pred_micro_labels = np.asarray([micro_classes[int(i)] for i in np.argmax(raw_micro_probs, axis=1)], dtype=object)
         gt_macro_labels = macro_labels_from_action(
             df["action_type"].astype(str).to_numpy() if "action_type" in df.columns else [OTHER_LABEL] * len(df),
             gt_micro_labels,
@@ -548,7 +1048,7 @@ def _evaluate_streams(
         macro_sample = sample_classification_metrics(gt_macro_labels, pred_macro_labels, macro_classes)
         micro_iou = segment_iou_f1(gt_micro_runs, pred_micro_runs)
         macro_iou = segment_iou_f1(gt_macro_runs, pred_macro_runs)
-        metric_rows.append({
+        row = {
             "stream_id": stream_id,
             "micro_source": micro_source,
             "sample_rate_hz": sample_rate,
@@ -565,7 +1065,33 @@ def _evaluate_streams(
             "macro_f1_at_10": macro_iou["f1_at_10"],
             "macro_f1_at_25": macro_iou["f1_at_25"],
             "macro_f1_at_50": macro_iou["f1_at_50"],
-        })
+        }
+        if semantic_pred_micro_labels is not None:
+            semantic_label_set = list(semantic_micro_classes) if semantic_micro_classes else list(micro_classes)
+            semantic_positive = [label for label in semantic_label_set if label != OTHER_LABEL]
+            semantic_gt_runs = labels_to_runs(
+                semantic_gt_micro_labels,
+                positive_labels=semantic_positive,
+                min_length=mm_cfg.min_phase_samples,
+            )
+            semantic_pred_runs = labels_to_runs(
+                semantic_pred_micro_labels,
+                positive_labels=semantic_positive,
+                probabilities=semantic_raw_micro_probs if semantic_raw_micro_probs is not None else raw_micro_probs,
+                min_length=mm_cfg.min_phase_samples,
+            )
+            semantic_sample = sample_classification_metrics(semantic_gt_micro_labels, semantic_pred_micro_labels, semantic_label_set)
+            semantic_iou = segment_iou_f1(semantic_gt_runs, semantic_pred_runs)
+            row.update(
+                {
+                    "micro_semantic_sample_accuracy": semantic_sample["accuracy"],
+                    "micro_semantic_sample_macro_f1": semantic_sample["macro_f1"],
+                    "micro_semantic_f1_at_10": semantic_iou["f1_at_10"],
+                    "micro_semantic_f1_at_25": semantic_iou["f1_at_25"],
+                    "micro_semantic_f1_at_50": semantic_iou["f1_at_50"],
+                }
+            )
+        metric_rows.append(row)
         pred_rows.extend(reps_to_rows(stream_id, pred_reps))
         diag_rows.extend(diagnostics_to_rows(stream_id, diagnostics))
 
@@ -641,6 +1167,11 @@ def _evaluate_streams(
             "macro_f1_at_10",
             "macro_f1_at_25",
             "macro_f1_at_50",
+            "micro_semantic_sample_accuracy",
+            "micro_semantic_sample_macro_f1",
+            "micro_semantic_f1_at_10",
+            "micro_semantic_f1_at_25",
+            "micro_semantic_f1_at_50",
         ):
             if key in metrics_df:
                 overall[key] = float(metrics_df[key].dropna().mean())
@@ -665,17 +1196,26 @@ def _write_report_md(
 ) -> None:
     overall = dict(summary.get("overall", {}) or {})
     primary_keys = [
-        "precision",
-        "recall",
-        "f1",
         "start_mae_ms",
         "end_mae_ms",
         "transition_mae_ms",
+        "precision",
+        "recall",
+        "f1",
+        "n_pred",
+        "n_true",
+        "tp",
+        "fp",
+        "fn",
         "rep_action_accuracy",
         "micro_sample_macro_f1",
         "micro_f1_at_10",
         "micro_f1_at_25",
         "micro_f1_at_50",
+        "micro_semantic_sample_macro_f1",
+        "micro_semantic_f1_at_10",
+        "micro_semantic_f1_at_25",
+        "micro_semantic_f1_at_50",
         "macro_sample_macro_f1",
         "macro_f1_at_10",
         "macro_f1_at_25",
@@ -713,6 +1253,20 @@ def _write_report_md(
         f"| Epochs | `{train_cfg.epochs}` |",
         f"| Slice seconds | `{mm_cfg.slice_seconds}` |",
         f"| Overlap | `{mm_cfg.overlap}` |",
+        f"| Micro label mode | `{mm_cfg.micro_label_mode}` |",
+        f"| Dual micro head | `{mm_cfg.use_dual_micro_head}` |",
+        f"| Semantic micro mode | `{mm_cfg.semantic_micro_label_mode}` |",
+        f"| Semantic alpha | `{mm_cfg.semantic_alpha}` |",
+        f"| Semantic->phase fusion | `{mm_cfg.semantic_phase_fusion_weight}` |",
+        f"| Semantic->macro concat | `{mm_cfg.use_semantic_for_macro}` |",
+        f"| Micro smoothing window | `{mm_cfg.micro_smoothing_window}` |",
+        f"| Micro class weights | `{mm_cfg.micro_class_weights or 'default'}` |",
+        f"| Semantic class weights | `{mm_cfg.semantic_micro_class_weights or 'default'}` |",
+        f"| Micro TMSE weight/threshold | `{mm_cfg.micro_tmse_weight}/{mm_cfg.micro_tmse_threshold}` |",
+        f"| Stage1 pretrain epochs | `{mm_cfg.stage1_pretrain_epochs}` |",
+        f"| Micro decoder | `{mm_cfg.micro_decoder}` |",
+        f"| Micro decoder penalties | `switch={mm_cfg.micro_decoder_switch_penalty}, invalid={mm_cfg.micro_decoder_invalid_transition_penalty}` |",
+        f"| Micro decoder min run | `{mm_cfg.micro_decoder_min_run_samples}` |",
         f"| Resample to window rate | `{mm_cfg.resample_to_window_rate}` |",
         f"| TCN filters/layers | `{mm_cfg.num_filters}/{mm_cfg.num_layers}` |",
         f"| Causal convolution | `{mm_cfg.causal}` |",
@@ -775,6 +1329,10 @@ def run(
         raise ValueError(f"Unsupported micro_source: {resolved_micro_source}")
     mm_cfg = MicroMacroConfig(**mm_raw)
     dtw_cfg = DTWMicroConfig(**dtw_raw)
+    if resolved_micro_source == "dtw" and str(mm_cfg.micro_label_mode).lower() != "phase":
+        raise ValueError("DTW micro_source currently supports only micro_label_mode=phase")
+    if resolved_micro_source == "dtw" and bool(mm_cfg.use_dual_micro_head):
+        raise ValueError("DTW micro_source currently does not support use_dual_micro_head=true")
     set_seed(int(train_cfg.seed))
     device = _resolve_device(train_cfg.device)
     train_cfg.device = str(device)
@@ -793,6 +1351,8 @@ def run(
         print(f"[INFO] resampled streams to {target_sample_rate} Hz using time_column={time_column}", flush=True)
     subject_column = str(feature_cfg.get("subject_column", "subject_id"))
     macro_classes = [OTHER_LABEL] + [a for a in actions if a != OTHER_LABEL]
+    micro_classes = _micro_classes_for_mode(actions, mm_cfg.micro_label_mode)
+    semantic_micro_classes = _micro_classes_for_mode(actions, mm_cfg.semantic_micro_label_mode) if bool(mm_cfg.use_dual_micro_head) else []
     if not streams:
         raise RuntimeError("No streams found for micro/macro recognition")
 
@@ -803,22 +1363,35 @@ def run(
         (output_dir / sub).mkdir(parents=True, exist_ok=True)
 
     subjects_sorted = sorted(set(subjects))
-    test_subject = str(train_cfg.test_subject) if train_cfg.test_subject else subjects_sorted[-1]
-    if test_subject not in subjects_sorted:
-        raise ValueError(f"Configured test_subject={test_subject!r} not found in subjects: {subjects_sorted}")
-    train_subjects = [s for s in subjects_sorted if s != test_subject]
-    train_streams = _filter_subjects(streams, train_subjects, subject_column)
-    test_streams = _filter_subjects(streams, [test_subject], subject_column)
+    configured_test_subject = str(train_cfg.test_subject) if train_cfg.test_subject else subjects_sorted[-1]
+    train_all_subjects = _is_all_subjects_mode(configured_test_subject)
+    if train_all_subjects:
+        test_subject = "__all__"
+        train_subjects = list(subjects_sorted)
+        train_streams = list(streams)
+        test_streams = list(streams)
+        evaluation_protocol = "train_all_in_sample"
+    else:
+        test_subject = configured_test_subject
+        if test_subject not in subjects_sorted:
+            raise ValueError(f"Configured test_subject={test_subject!r} not found in subjects: {subjects_sorted}")
+        train_subjects = [s for s in subjects_sorted if s != test_subject]
+        train_streams = _filter_subjects(streams, train_subjects, subject_column)
+        test_streams = _filter_subjects(streams, [test_subject], subject_column)
+        evaluation_protocol = "subject_holdout"
     train_sequences = [df for _, df in train_streams]
     test_sequences = [df for _, df in test_streams]
     train_split_subjects = {str(df.iloc[0]["_split_subject"]) for _, df in train_streams if "_split_subject" in df.columns and len(df)}
     test_split_subjects = {str(df.iloc[0]["_split_subject"]) for _, df in test_streams if "_split_subject" in df.columns and len(df)}
     overlap_subjects = sorted(train_split_subjects & test_split_subjects)
-    if overlap_subjects:
+    if overlap_subjects and not train_all_subjects:
         raise RuntimeError(f"Subject-wise split leakage detected: {overlap_subjects}")
     print(f"[INFO] micro_source={resolved_micro_source} modes={modes} train_subjects={train_subjects} test_subject={test_subject}")
     print(f"[INFO] streams train={len(train_streams)} test={len(test_streams)} actions={macro_classes}")
-    print(f"[INFO] subject-wise split verified: train={sorted(train_split_subjects)} test={sorted(test_split_subjects)}")
+    if train_all_subjects:
+        print(f"[INFO] evaluation_protocol={evaluation_protocol} subjects={subjects_sorted}", flush=True)
+    else:
+        print(f"[INFO] subject-wise split verified: train={sorted(train_split_subjects)} test={sorted(test_split_subjects)}")
     print(
         "[INFO] resources "
         f"device={device} amp={bool(train_cfg.amp) and device.type == 'cuda'} "
@@ -836,7 +1409,7 @@ def run(
     slice_len = max(8, int(round(float(mm_cfg.slice_seconds) * sample_rate)))
     stride_len = max(1, int(round(slice_len * (1.0 - float(mm_cfg.overlap)))))
     single_rf = 1 + (int(mm_cfg.kernel_size) - 1) * sum(2 ** i for i in range(int(mm_cfg.num_layers)))
-    total_rf = 1 + 4 * (single_rf - 1)
+    total_rf = 1 + int(mm_cfg.num_macro_stages) * (single_rf - 1)
     if bool(mm_cfg.causal) and slice_len < total_rf:
         print(
             f"[WARN] slice_len={slice_len} is shorter than estimated causal total RF={total_rf}; "
@@ -852,9 +1425,13 @@ def run(
     ds = SequenceSliceDataset(
         train_sequences,
         imu_columns,
+        micro_classes,
         macro_classes,
         slice_len=slice_len,
         stride_len=stride_len,
+        micro_label_mode=mm_cfg.micro_label_mode,
+        semantic_micro_classes=semantic_micro_classes,
+        semantic_micro_label_mode=mm_cfg.semantic_micro_label_mode,
         use_gt_micro_probs=use_gt_micro_probs,
     )
     if dry_run:
@@ -872,7 +1449,8 @@ def run(
     model = DSMSTCN(
         DSMSTCNConfig(
             input_channels=len(imu_columns),
-            micro_classes=len(MICRO_LABELS),
+            micro_classes=len(micro_classes),
+            semantic_micro_classes=len(semantic_micro_classes),
             macro_classes=len(macro_classes),
             num_filters=int(mm_cfg.num_filters),
             num_layers=int(mm_cfg.num_layers),
@@ -880,14 +1458,18 @@ def run(
             dropout=float(mm_cfg.dropout),
             causal=bool(mm_cfg.causal),
             num_macro_stages=int(mm_cfg.num_macro_stages),
+            use_dual_micro_head=bool(mm_cfg.use_dual_micro_head),
+            use_semantic_for_macro=bool(mm_cfg.use_semantic_for_macro),
+            use_rep_count_head=float(mm_cfg.rep_count_weight) > 0.0,
         )
     )
-    _train_model(model, loader, train_cfg, mm_cfg, use_gt_micro_probs=use_gt_micro_probs)
+    _train_model(model, loader, train_cfg, mm_cfg, micro_classes, semantic_micro_classes, use_gt_micro_probs=use_gt_micro_probs)
     torch.save(
         {
             "model_state": model.state_dict(),
             "macro_classes": macro_classes,
-            "micro_classes": list(MICRO_LABELS),
+            "micro_classes": micro_classes,
+            "semantic_micro_classes": semantic_micro_classes,
             "imu_columns": list(imu_columns),
             "config": asdict(mm_cfg),
         },
@@ -900,6 +1482,8 @@ def run(
         train_sequences_for_dtw=train_sequences,
         imu_columns=imu_columns,
         macro_classes=macro_classes,
+        micro_classes=micro_classes,
+        semantic_micro_classes=semantic_micro_classes,
         micro_source=resolved_micro_source,
         mm_cfg=mm_cfg,
         dtw_cfg=dtw_cfg,
@@ -913,6 +1497,7 @@ def run(
             "model_name": f"ds_ms_tcn_{resolved_micro_source}",
             "configured_micro_source": configured_micro_source,
             "resolved_micro_source": resolved_micro_source,
+            "evaluation_protocol": evaluation_protocol,
             "modes": modes,
             "train_subjects": train_subjects,
             "test_subject": test_subject,
@@ -920,13 +1505,32 @@ def run(
             "verified_test_split_subjects": sorted(test_split_subjects),
             "subject_split_overlap": overlap_subjects,
             "macro_classes": macro_classes,
-            "micro_classes": list(MICRO_LABELS),
+            "micro_classes": micro_classes,
+            "semantic_micro_classes": semantic_micro_classes,
+            "micro_label_mode": mm_cfg.micro_label_mode,
+            "semantic_micro_label_mode": mm_cfg.semantic_micro_label_mode,
+            "use_dual_micro_head": bool(mm_cfg.use_dual_micro_head),
+            "use_semantic_for_macro": bool(mm_cfg.use_semantic_for_macro),
+            "semantic_alpha": float(mm_cfg.semantic_alpha),
+            "semantic_phase_fusion_weight": float(mm_cfg.semantic_phase_fusion_weight),
+            "semantic_micro_class_weights": list(mm_cfg.semantic_micro_class_weights),
             "sample_rate_hz_for_training_slices": sample_rate,
             "slice_len_samples": slice_len,
             "stride_len_samples": stride_len,
             "resample_to_window_rate": bool(mm_cfg.resample_to_window_rate),
             "min_rep_duration_seconds": float(mm_cfg.min_rep_duration_seconds),
             "min_rep_confidence": float(mm_cfg.min_rep_confidence),
+            "micro_smoothing_window": int(mm_cfg.micro_smoothing_window),
+            "micro_class_weights": list(mm_cfg.micro_class_weights),
+            "micro_tmse_weight": float(mm_cfg.micro_tmse_weight),
+            "micro_tmse_threshold": float(mm_cfg.micro_tmse_threshold),
+            "semantic_alpha": float(mm_cfg.semantic_alpha),
+            "stage1_pretrain_epochs": int(mm_cfg.stage1_pretrain_epochs),
+            "micro_decoder": str(mm_cfg.micro_decoder),
+            "micro_decoder_switch_penalty": float(mm_cfg.micro_decoder_switch_penalty),
+            "micro_decoder_invalid_transition_penalty": float(mm_cfg.micro_decoder_invalid_transition_penalty),
+            "micro_decoder_min_run_samples": int(mm_cfg.micro_decoder_min_run_samples),
+            "synthetic_whole_streams": bool((raw.get("data", {}) or {}).get("synthetic_whole_streams", False)),
             "primary_metrics": primary_metric_table(summary.get("overall", {}) or {}),
         }
     )
@@ -947,6 +1551,23 @@ def run(
             "resample_to_window_rate": bool(mm_cfg.resample_to_window_rate),
             "min_rep_duration_seconds": float(mm_cfg.min_rep_duration_seconds),
             "min_rep_confidence": float(mm_cfg.min_rep_confidence),
+            "micro_smoothing_window": int(mm_cfg.micro_smoothing_window),
+            "micro_class_weights": list(mm_cfg.micro_class_weights),
+            "micro_label_mode": str(mm_cfg.micro_label_mode),
+            "semantic_micro_label_mode": str(mm_cfg.semantic_micro_label_mode),
+            "use_dual_micro_head": bool(mm_cfg.use_dual_micro_head),
+            "use_semantic_for_macro": bool(mm_cfg.use_semantic_for_macro),
+            "micro_tmse_weight": float(mm_cfg.micro_tmse_weight),
+            "micro_tmse_threshold": float(mm_cfg.micro_tmse_threshold),
+            "semantic_alpha": float(mm_cfg.semantic_alpha),
+            "semantic_phase_fusion_weight": float(mm_cfg.semantic_phase_fusion_weight),
+            "semantic_micro_class_weights": list(mm_cfg.semantic_micro_class_weights),
+            "stage1_pretrain_epochs": int(mm_cfg.stage1_pretrain_epochs),
+            "micro_decoder": str(mm_cfg.micro_decoder),
+            "micro_decoder_switch_penalty": float(mm_cfg.micro_decoder_switch_penalty),
+            "micro_decoder_invalid_transition_penalty": float(mm_cfg.micro_decoder_invalid_transition_penalty),
+            "micro_decoder_min_run_samples": int(mm_cfg.micro_decoder_min_run_samples),
+            "synthetic_whole_streams": bool((raw.get("data", {}) or {}).get("synthetic_whole_streams", False)),
         },
     )
     _write_report_md(output_dir, summary, config_path, train_cfg, mm_cfg, dtw_cfg)

@@ -1,0 +1,59 @@
+data:
+  data_dir: ./datasets/raw_data
+  csv_glob: "*.csv"
+  exclude_patterns: ["*whole_session*", "*_w", "*rest_after*"]
+  include_actions: [db_bench_press, db_rdl, one_arm_db_row]
+
+io:
+  micro_macro_output_dir: ./artifacts/micro_macro_recognition
+
+feature:
+  imu_columns: [ax, ay, az, gx, gy, gz]
+  label_column: action_type
+  subject_column: subject_id
+  time_column: sensor_ts
+
+window:
+  sample_rate_hz: 100
+
+train:
+  seed: 42
+  batch_size: 32
+  epochs: 40
+  lr: 0.0003
+  weight_decay: 0.00001
+  test_subject: kevin
+  device: auto
+  num_workers: auto
+  pin_memory: auto
+  amp: true
+
+micro_macro:
+  micro_source: tcn
+  train_on_modes: [sets]
+  slice_seconds: 20.0
+  overlap: 0.50
+  num_filters: 64
+  num_layers: 6
+  kernel_size: 3
+  dropout: 0.2
+  causal: true
+  num_macro_stages: 3
+  alpha: 1.0
+  beta: 0.15
+  tmse_threshold: 4.0
+  max_phase_gap_samples: 3
+  min_phase_samples: 3
+  min_rep_duration_seconds: 1.2
+  min_rep_confidence: 0.0
+  micro_smoothing_window: 15
+  resample_to_window_rate: true
+  plot_max_streams: 24
+  use_dual_micro_head: true
+  use_semantic_for_macro: false
+  semantic_micro_label_mode: action_phase
+  semantic_alpha: 0.5
+  micro_decoder: viterbi
+  micro_decoder_switch_penalty: 1.5
+  micro_decoder_invalid_transition_penalty: 10.0
+  micro_decoder_min_run_samples: 16

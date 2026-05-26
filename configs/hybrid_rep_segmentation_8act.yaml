@@ -1,0 +1,65 @@
+data:
+  data_dir: ./datasets/raw_data
+  csv_glob: "*.csv"
+  exclude_patterns: ["*whole_session*", "*_w", "*rest_after*"]
+  include_actions:
+    - db_bench_press
+    - db_biceps_curl
+    - db_rdl
+    - db_shoulder_press
+    - db_squat
+    - db_triceps_curl
+    - db_weighted_crunch
+    - one_arm_db_row
+
+io:
+  output_dir: ./artifacts/action_classification
+  phase_output_dir: ./artifacts/phase_segmentation
+  rep_segmentation_output_dir: ./artifacts/rep_segmentation
+
+feature:
+  imu_columns: [ax, ay, az, gx, gy, gz]
+  label_column: action_type
+  subject_column: subject_id
+  time_column: sensor_ts
+
+segmentation:
+  sdtw:
+    motion_columns: [ax, ay, az, gx, gy, gz, mx, my, mz]
+    smoothing_window: 9
+    min_point_gap: 8
+    point_value_epsilon: 0.08
+    min_scale_percent: 0.55
+    threshold_percentile: 60.0
+    threshold_margin: 0.02
+    duration_min_ratio: 0.55
+    duration_max_ratio: 1.75
+    max_overlap_iou: 0.20
+    max_candidates_per_endpoint: 30
+    template_middle_fraction: 0.50
+    template_min_edge_reps: 1
+    max_templates: 3
+
+hybrid:
+  label_iou: 0.30
+  prob_threshold: 0.30
+  cost_threshold_scale: 1.5
+  nms_iou: 0.20
+  enable_boundary_refiner: true
+  edge_window_samples: 20
+  refiner_train_iou: 0.30
+  refiner_time_limit_s: 90
+  refiner_max_shift_samples: 30
+  presets: medium_quality_faster_train
+  time_limit_s: 300
+  eval_metric: f1
+  num_cpus: null
+  memory_limit_gb: 4
+  included_model_types: null
+  excluded_model_types: [NN_TORCH, FASTAI, GBM, XGB]
+  num_bag_folds: 0
+  num_stack_levels: 0
+  keep_only_best: true
+  save_space: true
+  delete_predictor_after_eval: true
+  subject_stratified_validation: true

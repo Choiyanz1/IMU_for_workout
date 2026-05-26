@@ -54,15 +54,20 @@ def _first_existing(mapping: Mapping[str, Any], keys: Sequence[str]) -> Any:
 def primary_metric_table(metrics: Mapping[str, Any]) -> Dict[str, Any]:
     """Normalize common metric names across tasks for easier comparison."""
     return {
-        "accuracy": _first_existing(metrics, ("accuracy", "test_accuracy")),
-        "macro_f1": _first_existing(metrics, ("macro_f1", "macro_sample_macro_f1")),
-        "precision": _first_existing(metrics, ("precision",)),
-        "recall": _first_existing(metrics, ("recall",)),
-        "f1": _first_existing(metrics, ("f1",)),
-        "iou_f1_50": _first_existing(metrics, ("macro_f1_at_50", "micro_f1_at_50", "f1_at_50")),
         "start_mae_ms": _first_existing(metrics, ("start_mae_ms",)),
         "end_mae_ms": _first_existing(metrics, ("end_mae_ms",)),
         "transition_mae_ms": _first_existing(metrics, ("transition_mae_ms",)),
+        "precision": _first_existing(metrics, ("precision",)),
+        "recall": _first_existing(metrics, ("recall",)),
+        "f1": _first_existing(metrics, ("f1",)),
+        "n_pred": _first_existing(metrics, ("n_pred",)),
+        "n_true": _first_existing(metrics, ("n_true",)),
+        "tp": _first_existing(metrics, ("tp",)),
+        "fp": _first_existing(metrics, ("fp",)),
+        "fn": _first_existing(metrics, ("fn",)),
+        "iou_f1_50": _first_existing(metrics, ("macro_f1_at_50", "micro_f1_at_50", "f1_at_50")),
+        "accuracy": _first_existing(metrics, ("accuracy", "test_accuracy")),
+        "macro_f1": _first_existing(metrics, ("macro_f1", "macro_sample_macro_f1")),
     }
 
 

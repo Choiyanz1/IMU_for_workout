@@ -370,6 +370,7 @@ def train_action_classification(config_path: Path, dry_run: bool = False, use_ti
         csv_glob=csv_glob,
         exclude_patterns=exclude_patterns,
         include_actions=include_actions,
+        subject_aliases=data_cfg.get("subject_aliases", None),
     )
     print(f"[INFO] Loaded {len(sequences)} sequences from {len(set(subjects))} subjects")
 

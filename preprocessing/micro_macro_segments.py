@@ -42,6 +42,85 @@ class PairingDiagnostic:
     end_idx: int
 
 
+@dataclass
+class OnlineRepEvent:
+    rep: RepDetection
+    emit_sample_idx: int
+
+
+@dataclass
+class StableActionDisplayState:
+    rep_count: int = 0
+    display_action: str = "pending"
+    display_action_confidence: float = float("nan")
+    display_locked: bool = False
+    action_switch_count: int = 0
+
+
+class StableActionDisplayTracker:
+    """App-friendly action display state machine driven by completed reps.
+
+    The intent is to avoid sample-by-sample action flicker. Action is updated
+    only after completed reps, and only when recent rep labels agree enough.
+    """
+
+    def __init__(
+        self,
+        vote_window: int = 3,
+        min_reps_to_lock: int = 2,
+        min_vote_fraction: float = 0.67,
+        min_action_confidence: float = 0.0,
+    ) -> None:
+        self.vote_window = max(1, int(vote_window))
+        self.min_reps_to_lock = max(1, int(min_reps_to_lock))
+        self.min_vote_fraction = float(min_vote_fraction)
+        self.min_action_confidence = float(min_action_confidence)
+        self.reset()
+
+    def reset(self) -> None:
+        self.completed_reps = 0
+        self.history: List[Tuple[str, float]] = []
+        self.display_action = "pending"
+        self.display_action_confidence = float("nan")
+        self.display_locked = False
+        self.action_switch_count = 0
+
+    def snapshot(self) -> StableActionDisplayState:
+        return StableActionDisplayState(
+            rep_count=int(self.completed_reps),
+            display_action=str(self.display_action),
+            display_action_confidence=float(self.display_action_confidence),
+            display_locked=bool(self.display_locked),
+            action_switch_count=int(self.action_switch_count),
+        )
+
+    def update(self, rep: RepDetection) -> StableActionDisplayState:
+        self.completed_reps += 1
+        label = str(rep.pred_action_type)
+        confidence = float(rep.action_confidence) if np.isfinite(rep.action_confidence) else 0.0
+        if label not in {"unknown", "uncertain", OTHER_LABEL} and confidence >= self.min_action_confidence:
+            self.history.append((label, confidence))
+            self.history = self.history[-self.vote_window :]
+        if len(self.history) >= self.min_reps_to_lock:
+            counts: Dict[str, int] = {}
+            conf_sums: Dict[str, float] = {}
+            for hist_label, hist_conf in self.history:
+                counts[hist_label] = counts.get(hist_label, 0) + 1
+                conf_sums[hist_label] = conf_sums.get(hist_label, 0.0) + hist_conf
+            best_label = max(counts, key=lambda item: (counts[item], conf_sums[item]))
+            votes = int(counts[best_label])
+            vote_fraction = votes / max(1, len(self.history))
+            mean_conf = conf_sums[best_label] / max(1, votes)
+            if vote_fraction >= self.min_vote_fraction and votes >= self.min_reps_to_lock:
+                previous = self.display_action
+                if previous not in {"pending", best_label}:
+                    self.action_switch_count += 1
+                self.display_action = best_label
+                self.display_action_confidence = float(mean_conf)
+                self.display_locked = True
+        return self.snapshot()
+
+
 def micro_labels_from_phase(phases: Sequence[object]) -> np.ndarray:
     labels = []
     for phase in phases:
@@ -169,6 +248,175 @@ def aggregate_action_for_reps(
             )
         )
     return out
+
+
+def _aggregate_rep_action(
+    start_idx: int,
+    end_idx: int,
+    macro_prob_history: Sequence[np.ndarray],
+    macro_classes: Sequence[str],
+    exclude_other: bool = True,
+) -> tuple[str, float]:
+    classes = [str(c) for c in macro_classes]
+    start = max(0, int(start_idx))
+    end = min(len(macro_prob_history), int(end_idx))
+    if end <= start or not classes:
+        return "uncertain", float("nan")
+    stacked = np.stack(macro_prob_history[start:end], axis=0)
+    mean_prob = np.mean(stacked, axis=0)
+    candidate_indices = list(range(len(classes)))
+    if exclude_other and OTHER_LABEL in classes:
+        candidate_indices = [i for i, label in enumerate(classes) if label != OTHER_LABEL]
+    if not candidate_indices:
+        candidate_indices = list(range(len(classes)))
+    best_idx = max(candidate_indices, key=lambda i: float(mean_prob[i]))
+    label = classes[int(best_idx)]
+    if label == OTHER_LABEL:
+        label = "uncertain"
+    return label, float(mean_prob[int(best_idx)])
+
+
+class OnlineRepDecoder:
+    """Causal rep decoder from streaming micro labels/probabilities.
+
+    It emits a completed rep only after the eccentric run is observed to end,
+    which makes the event causal and suitable for runtime replay/deployment.
+    """
+
+    def __init__(
+        self,
+        macro_classes: Sequence[str],
+        min_phase_samples: int = 1,
+        max_gap_samples: int = 0,
+        exclude_other_action: bool = True,
+    ) -> None:
+        self.macro_classes = [str(c) for c in macro_classes]
+        self.min_phase_samples = max(1, int(min_phase_samples))
+        self.max_gap_samples = max(0, int(max_gap_samples))
+        self.exclude_other_action = bool(exclude_other_action)
+        self.reset()
+
+    def reset(self) -> None:
+        self.current_label: str | None = None
+        self.current_start_idx: int | None = None
+        self.current_end_idx: int | None = None
+        self.current_conf_sum = 0.0
+        self.current_count = 0
+        self.pending_concentric: SegmentRun | None = None
+        self.macro_prob_history: List[np.ndarray] = []
+        self.diagnostics: List[PairingDiagnostic] = []
+
+    def _start_run(self, label: str, sample_idx: int, confidence: float) -> None:
+        self.current_label = label
+        self.current_start_idx = int(sample_idx)
+        self.current_end_idx = int(sample_idx) + 1
+        self.current_conf_sum = float(confidence)
+        self.current_count = 1
+
+    def _finalize_current_run(self, emit_sample_idx: int) -> List[OnlineRepEvent]:
+        if self.current_label is None or self.current_start_idx is None or self.current_end_idx is None:
+            return []
+        label = self.current_label
+        start_idx = int(self.current_start_idx)
+        end_idx = int(self.current_end_idx)
+        confidence = float(self.current_conf_sum / max(1, self.current_count))
+        count = int(self.current_count)
+        self.current_label = None
+        self.current_start_idx = None
+        self.current_end_idx = None
+        self.current_conf_sum = 0.0
+        self.current_count = 0
+        if label not in {CONCENTRIC_LABEL, ECCENTRIC_LABEL} or count < self.min_phase_samples:
+            return []
+
+        run = SegmentRun(label=label, start_idx=start_idx, end_idx=end_idx, confidence=confidence)
+        return self._consume_finalized_run(run, emit_sample_idx)
+
+    def _consume_finalized_run(self, run: SegmentRun, emit_sample_idx: int) -> List[OnlineRepEvent]:
+        events: List[OnlineRepEvent] = []
+        if run.label == CONCENTRIC_LABEL:
+            if self.pending_concentric is not None:
+                self.diagnostics.append(
+                    PairingDiagnostic(
+                        "missing_eccentric_after_concentric",
+                        self.pending_concentric.label,
+                        self.pending_concentric.start_idx,
+                        self.pending_concentric.end_idx,
+                    )
+                )
+            self.pending_concentric = run
+            return events
+
+        if self.pending_concentric is None:
+            self.diagnostics.append(
+                PairingDiagnostic("unexpected_phase_before_concentric", run.label, run.start_idx, run.end_idx)
+            )
+            return events
+
+        gap = int(run.start_idx) - int(self.pending_concentric.end_idx)
+        if gap > self.max_gap_samples:
+            self.diagnostics.append(
+                PairingDiagnostic("phase_gap_too_large", self.pending_concentric.label, self.pending_concentric.start_idx, run.end_idx)
+            )
+            self.pending_concentric = None
+            return events
+
+        rep = RepDetection(
+            start_idx=int(self.pending_concentric.start_idx),
+            transition_idx=int(run.start_idx),
+            end_idx=int(run.end_idx),
+            micro_source="online",
+            micro_confidence=float((self.pending_concentric.confidence + run.confidence) / 2.0),
+        )
+        label, action_confidence = _aggregate_rep_action(
+            rep.start_idx,
+            rep.end_idx,
+            self.macro_prob_history,
+            self.macro_classes,
+            exclude_other=self.exclude_other_action,
+        )
+        rep.pred_action_type = label
+        rep.action_confidence = action_confidence
+        events.append(OnlineRepEvent(rep=rep, emit_sample_idx=int(emit_sample_idx)))
+        self.pending_concentric = None
+        return events
+
+    def update(self, sample_idx: int, micro_probs: Sequence[float], macro_probs: Sequence[float]) -> List[OnlineRepEvent]:
+        micro_probs_np = np.asarray(micro_probs, dtype=np.float32)
+        macro_probs_np = np.asarray(macro_probs, dtype=np.float32)
+        self.macro_prob_history.append(macro_probs_np.copy())
+        label = MICRO_LABELS[int(np.argmax(micro_probs_np))]
+        confidence = float(np.max(micro_probs_np))
+
+        if self.current_label is None:
+            if label in {CONCENTRIC_LABEL, ECCENTRIC_LABEL}:
+                self._start_run(label, int(sample_idx), confidence)
+            return []
+
+        if label == self.current_label:
+            self.current_end_idx = int(sample_idx) + 1
+            self.current_conf_sum += confidence
+            self.current_count += 1
+            return []
+
+        events = self._finalize_current_run(int(sample_idx))
+        if label in {CONCENTRIC_LABEL, ECCENTRIC_LABEL}:
+            self._start_run(label, int(sample_idx), confidence)
+        return events
+
+    def flush(self, last_sample_idx: int) -> List[OnlineRepEvent]:
+        events = self._finalize_current_run(int(last_sample_idx))
+        if self.pending_concentric is not None:
+            self.diagnostics.append(
+                PairingDiagnostic(
+                    "missing_eccentric_after_concentric",
+                    self.pending_concentric.label,
+                    self.pending_concentric.start_idx,
+                    self.pending_concentric.end_idx,
+                )
+            )
+            self.pending_concentric = None
+        return events
 
 
 def reps_to_rows(stream_id: str, reps: Sequence[RepDetection]) -> List[Dict[str, object]]:

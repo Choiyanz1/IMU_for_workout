@@ -6,9 +6,18 @@ data:
   # *whole_session* = skip duplicated whole-session CSVs
   # *_w            = skip corrupted sets (folder names ending with _w)
   exclude_patterns: ["*whole_session*", "*_w", "*rest_after*"]
-  # Only include these action types (null = all actions).
-  # The 4 actions common to every subject, excluding rest.
-  include_actions: [db_bench_press, db_rdl, db_weighted_crunch, one_arm_db_row]
+  # All 8 actions for comprehensive evaluation.
+  # Previously was [db_bench_press, db_rdl, db_weighted_crunch, one_arm_db_row]
+  # Expanded to all actions after config bug fix (sample_rate_hz was 50 not 100).
+  include_actions:
+    - db_bench_press
+    - db_biceps_curl
+    - db_rdl
+    - db_shoulder_press
+    - db_squat
+    - db_triceps_curl
+    - db_weighted_crunch
+    - one_arm_db_row
 
 io:
   output_dir: ./artifacts/action_classification
@@ -22,9 +31,17 @@ feature:
   time_column: sensor_ts
 
 window:
-  sample_rate_hz: 50
+  sample_rate_hz: 100  # FIXED: was 50, data is ~100 Hz
   window_seconds: 1.5
   stride_seconds: 0.5
+
+micro_macro:
+  # Rep Segmentation post-processing parameters.
+  # FIXED: These were missing in config.yaml, causing catastrophic over-segmentation.
+  min_rep_duration_seconds: 1.2
+  min_rep_confidence: 0.0
+  max_phase_gap_samples: 3
+  min_phase_samples: 3
 
 model:
   input_channels: 6

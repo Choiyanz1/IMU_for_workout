@@ -1,0 +1,95 @@
+data:
+  data_dir: ./datasets/raw_data
+  csv_glob: "*.csv"
+  exclude_patterns: ["*whole_session*", "*_w", "*rest_after*"]
+  include_actions:
+    - db_bench_press
+    - db_biceps_curl
+    - db_rdl
+    - db_shoulder_press
+    - db_squat
+    - db_triceps_curl
+    - db_weighted_crunch
+    - one_arm_db_row
+
+io:
+  output_dir: ./artifacts/action_classification
+  phase_output_dir: ./artifacts/phase_segmentation
+  rep_segmentation_output_dir: ./artifacts/rep_segmentation
+
+feature:
+  imu_columns: [ax, ay, az, gx, gy, gz]
+  label_column: action_type
+  subject_column: subject_id
+  time_column: sensor_ts
+
+window:
+  sample_rate_hz: 50
+  window_seconds: 1.5
+  stride_seconds: 0.5
+
+model:
+  input_channels: 6
+  num_classes: 8
+  patch_size: 10
+  embed_dim: 128
+  depth: 2
+  num_heads: 4
+  mlp_ratio: 2
+  dropout: 0.1
+
+train:
+  seed: 42
+  batch_size: 64
+  epochs: 30
+  lr: 0.0001
+  weight_decay: 0.00001
+  num_workers: 0
+  device: cpu
+
+autogluon:
+  feature_mode: rich
+  presets: medium_quality_faster_train
+  time_limit_s: 600
+  eval_metric: accuracy
+  num_cpus: null
+  memory_limit_gb: 4
+  included_model_types: null
+  excluded_model_types: [NN_TORCH, FASTAI, GBM, XGB]
+  num_bag_folds: 0
+  num_stack_levels: 0
+
+distill:
+  temperature: 3.0
+  alpha: 0.7
+  epochs: 50
+
+phase:
+  window_seconds: 0.6
+  stride_seconds: 0.1
+  feature_mode: rich
+  presets: medium_quality_faster_train
+  time_limit_s: 600
+  eval_metric: f1_macro
+  num_cpus: null
+  included_model_types: null
+  excluded_model_types: [NN_TORCH, FASTAI, GBM, XGB]
+  num_bag_folds: 0
+  num_stack_levels: 0
+
+segmentation:
+  sdtw:
+    motion_columns: [ax, ay, az, gx, gy, gz, mx, my, mz]
+    smoothing_window: 9
+    min_point_gap: 8
+    point_value_epsilon: 0.08
+    min_scale_percent: 0.55
+    threshold_percentile: 60.0
+    threshold_margin: 0.02
+    duration_min_ratio: 0.55
+    duration_max_ratio: 1.75
+    max_overlap_iou: 0.20
+    max_candidates_per_endpoint: 30
+    template_middle_fraction: 0.50
+    template_min_edge_reps: 1
+    max_templates: 3

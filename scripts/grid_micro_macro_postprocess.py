@@ -10,7 +10,7 @@ import torch
 import yaml
 
 from evaluation.streaming_micro_macro import _load_model, _resolve_run_dir
-from models.ds_ms_tcn import DSMSTCN, DSMSTCNConfig
+from models.ds_ms_tcn import DSMSTCN, DSMSTCNConfig, load_dsmstcn_state_dict
 from preprocessing.micro_macro_segments import (
     CONCENTRIC_LABEL,
     ECCENTRIC_LABEL,
@@ -70,23 +70,28 @@ def _load_model_for_grid(run_dir: Path, device: torch.device, causal_override: s
         payload = torch.load(ckpt_path, map_location=device)
     macro_classes = [str(x) for x in payload["macro_classes"]]
     micro_classes = [str(x) for x in payload.get("micro_classes", MICRO_LABELS)]
+    semantic_micro_classes = [str(x) for x in payload.get("semantic_micro_classes", [])]
     imu_columns = [str(x) for x in payload["imu_columns"]]
     cfg_raw = dict(payload.get("config", {}) or {})
     model = DSMSTCN(
         DSMSTCNConfig(
             input_channels=len(imu_columns),
             micro_classes=len(micro_classes),
+            semantic_micro_classes=len(semantic_micro_classes),
             macro_classes=len(macro_classes),
             num_filters=int(cfg_raw.get("num_filters", 64)),
             num_layers=int(cfg_raw.get("num_layers", 9)),
             kernel_size=int(cfg_raw.get("kernel_size", 3)),
             dropout=float(cfg_raw.get("dropout", 0.2)),
             causal=causal_override == "true",
+            num_macro_stages=int(cfg_raw.get("num_macro_stages", 4)),
+            use_dual_micro_head=bool(cfg_raw.get("use_dual_micro_head", False)),
+            use_semantic_for_macro=bool(cfg_raw.get("use_semantic_for_macro", False)),
         )
     )
-    model.load_state_dict(payload["model_state"])
+    load_dsmstcn_state_dict(model, payload["model_state"])
     model.to(device).eval()
-    return model, macro_classes, micro_classes, imu_columns
+    return model, macro_classes, micro_classes, semantic_micro_classes, imu_columns
 
 
 def _aggregate(rows: list[dict[str, float]]) -> dict[str, float]:

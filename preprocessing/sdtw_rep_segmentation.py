@@ -356,7 +356,11 @@ def _build_template_from_exemplar(
     matrix, feature_names = build_motion_features(exemplar_df, imu_columns)
     matrix = normalize_matrix(smooth_matrix(matrix, config.smoothing_window))
     ranked = rank_features(matrix, feature_names)
-    dtw_feature = ranked[0]
+    # 使用 acc_mag 作為 DTW 特徵（如果可用），否則使用變化量最大的特徵
+    if "acc_mag" in feature_names:
+        dtw_feature = "acc_mag"
+    else:
+        dtw_feature = ranked[0]
     feature_idx = feature_names.index(dtw_feature)
     query_indices, query_values = extract_segment_points(
         matrix[:, feature_idx],

@@ -1,0 +1,10 @@
+{
+  "micro_labels": [
+    "other",
+    "concentric",
+    "eccentric"
+  ],
+  "other_label": "other",
+  "eccentric_label": "eccentric",
+  "concentric_label": "concentric"
+}

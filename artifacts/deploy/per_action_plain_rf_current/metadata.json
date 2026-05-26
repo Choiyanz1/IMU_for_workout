@@ -1,0 +1,82 @@
+{
+  "artifact_name": "per_action_plain_rf_current",
+  "model_family": "per-action causal RandomForestClassifier",
+  "source_config": "config.yaml",
+  "actions": [
+    "db_bench_press",
+    "db_biceps_curl",
+    "db_rdl",
+    "db_shoulder_press",
+    "db_squat",
+    "db_triceps_curl",
+    "db_weighted_crunch",
+    "one_arm_db_row"
+  ],
+  "imu_columns": [
+    "ax",
+    "ay",
+    "az",
+    "gx",
+    "gy",
+    "gz"
+  ],
+  "sample_rate_hz": 100,
+  "excluded_session_substrings": [
+    "yanz/1000",
+    "thomas/thomas",
+    "thomas/thomas_2",
+    "kevin/kevin",
+    "_tsenyu_temp",
+    "_ziho_temp"
+  ],
+  "hyperparameters": {
+    "window_size": 100,
+    "train_stride": 10,
+    "n_estimators": 100,
+    "max_depth": 15,
+    "max_samples": 0.7
+  },
+  "action_artifacts": {
+    "db_bench_press": {
+      "streams": 15,
+      "model": "models/db_bench_press.joblib",
+      "normalization": "normalization/db_bench_press.json"
+    },
+    "db_biceps_curl": {
+      "streams": 16,
+      "model": "models/db_biceps_curl.joblib",
+      "normalization": "normalization/db_biceps_curl.json"
+    },
+    "db_rdl": {
+      "streams": 15,
+      "model": "models/db_rdl.joblib",
+      "normalization": "normalization/db_rdl.json"
+    },
+    "db_shoulder_press": {
+      "streams": 15,
+      "model": "models/db_shoulder_press.joblib",
+      "normalization": "normalization/db_shoulder_press.json"
+    },
+    "db_squat": {
+      "streams": 15,
+      "model": "models/db_squat.joblib",
+      "normalization": "normalization/db_squat.json"
+    },
+    "db_triceps_curl": {
+      "streams": 15,
+      "model": "models/db_triceps_curl.joblib",
+      "normalization": "normalization/db_triceps_curl.json"
+    },
+    "db_weighted_crunch": {
+      "streams": 15,
+      "model": "models/db_weighted_crunch.joblib",
+      "normalization": "normalization/db_weighted_crunch.json"
+    },
+    "one_arm_db_row": {
+      "streams": 16,
+      "model": "models/one_arm_db_row.joblib",
+      "normalization": "normalization/one_arm_db_row.json"
+    }
+  },
+  "inference_note": "Apply the per-action z-score stats, extract trailing 1.0s RF features, then call the corresponding action model."
+}

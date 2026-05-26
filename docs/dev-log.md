@@ -1,5 +1,18 @@
 # Development Log
 
+## 2026-05-26 - Deployable Per-Action RF Export
+
+### What Changed
+- Added `scripts/export_per_action_plain_rf_models.py` to export deployable per-action causal Random Forest models.
+- Trained 8 action-specific RF models with 1.0s trailing windows, 100 trees, max depth 15, max samples 0.7, and per-action z-score normalization.
+- Wrote the deployable artifact to `artifacts/deploy/per_action_plain_rf_current/` with `model.joblib` files, normalization stats, label map, and metadata.
+
+### Takeaway
+- This is the currently committed deployable model artifact for later inference/use.
+- The stronger raw6 CNN + `top5_p5` research pipeline still has no saved checkpoint, so it remains reproducible through scripts/results rather than a loadable deployed model.
+
+---
+
 ## 2026-05-20 - Action-Conditioned Decoder Policy Search
 
 ### What Changed

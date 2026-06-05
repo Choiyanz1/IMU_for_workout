@@ -1,5 +1,224 @@
 # Development Log
 
+## 2026-06-05 - Full Auto Realtime Deployment Bundle
+
+### What Changed
+- Added `scripts/export_full_auto_realtime_bundle.py` to train/export the current full automatic pipeline as one deploy bundle.
+- Added `scripts/run_full_auto_realtime_bundle.py` to run the bundle on saved IMU CSV or raw `zig_bt_client --stdout` input.
+- Exported current bundle to `artifacts/deploy/full_auto_realtime_current/` with phase CNN, ONNX, periodic active gate RF, action RF heads, JSON RF tree exports, normalization stats, duration priors, and runtime config.
+- Documented commands and Luckfox caveats in `docs/experiments/2026-06-05-full-auto-realtime-bundle.md`.
+
+### Results
+- Smoke bundle export passed with `--epochs 1 --hidden 16 --skip-onnx`.
+- Current bundle export passed with `--epochs 5 --hidden 64`; `phase_model.onnx` was generated.
+- Torch CPU replay passed on `_tsenyu_temp/tsenyu0515workout/db_biceps_curl/set0` sample CSV: predicted action `db_biceps_curl`, count `12`.
+- ONNX replay on the same sample also passed: predicted action `db_biceps_curl`, count `12`.
+- ONNX + JSON RF replay also passed on the same sample: predicted action `db_biceps_curl`, count `12`, with no pandas/sklearn/joblib inference dependency.
+- Added `--emit-mode jsonl-events` to `scripts/run_full_auto_realtime_bundle.py`; ONNX + JSON RF live-style replay emitted 12 rep events and a final summary with `count=12`, matching batch replay on the smoke sample.
+- Added `--emit-mode stateful-jsonl` to `scripts/run_full_auto_realtime_bundle.py`; ONNX + JSON RF stateful replay emitted 12 rep events and a final summary with `count=12` on the same smoke sample.
+- Stateful replay is closer to the board loop than `jsonl-events`: it updates active/action RFs at configured strides, runs the phase CNN at the phase step, finalizes fixed-lag labels incrementally, and feeds newly finalized labels into a streaming parser. On the smoke sample it produced the same action/count as batch replay, but causal active entry changed boundary timing slightly (`active_samples=6476` vs batch `6525`; first rep start shifted from sample `0` to `49`).
+- Prepared a minimal manual-transfer package at `artifacts/deploy/full_auto_realtime_portable/` and `artifacts/deploy/full_auto_realtime_portable.zip`. It includes only the ONNX + JSON RF inference path and smoke sample, excluding datasets, `.pt`, `.joblib`, training scripts, and evaluation artifacts. Portable validation from inside that folder passed with final replay and `stateful-jsonl`, both giving `db_biceps_curl`, count `12`.
+
+### Takeaway
+- `artifacts/deploy/full_auto_realtime_current/` is now the packaged full automatic engineering baseline for later Luckfox Pico Zero work.
+- The bundle is closer to board-ready: active/action gates can now run from JSON RF trees with pure NumPy via `--rf-runtime json`, and the runner can emit JSONL rep events via `--emit-mode stateful-jsonl`. It is still not a final RKNN-only artifact because `phase_model.onnx` still needs RKNN conversion, and stateful mode still needs broader full-session validation beyond the smoke replay.
+- Full-session quality remains active-gate-limited, but the packaging now separates model/runtime config so active gate thresholds can be adjusted without retraining the CNN.
+
+---
+
+## 2026-06-04 - Active Gate Full-Session Research
+
+### What Changed
+- Added `scripts/evaluate_periodic_active_gate_loso.py` to test active/rest gates independently from the phase CNN.
+- Added periodicity-aware active features: magnitude/jerk autocorrelation, frequency-band power, dominant frequency, spectral entropy, and zero-crossing features.
+- Added `scripts/evaluate_active_cnn_full_timeline_loso.py`, including an optional CNN+RF hybrid verifier where the CNN proposes active segments and a basic/periodic RF rejects weak segments.
+- Extended `scripts/evaluate_realtime_soft_top5_pipeline.py` with optional periodic active gates, active-masked fixed-lag parsing, active segment cleanup, and candidate set confirmation.
+- Added event-level confirmation to `scripts/evaluate_realtime_soft_top5_pipeline.py`: fixed-lag reps are grouped into candidate events, held in a buffer, and released retroactively only after event confirmation.
+- Documented the analysis in `docs/experiments/2026-06-04-active-gate-full-session-research.md`.
+
+### Results
+- Standalone active gate, 9-fold LOSO: periodic RF improved set F1 from `0.875` to `0.895` and rest false-active/min from `1.84` to `1.49`, but rest-tail active rate stayed high (`0.086`).
+- Conservative periodic gate with `min_active_samples=400` reduced rest false-active/min to `0.91`, but rest-tail active rate remained `0.078`.
+- Full-timeline CNN active segmenter, 9-fold LOSO e2/h16 with `max_pos_weight=1.0`, reached set F1 `0.905`, set recall `0.879`, rest false-active/min `2.12`, appended false-active/min `1.40`, and `117` rest-tail segments.
+- Soft CNN+periodic hybrid verification reduced rest false-active/min to `1.54`, appended false-active/min to `1.17`, and rest-tail segments to `103`, but lowered set F1 to `0.866` and set recall to `0.836`.
+- Larger e5/h32 CNN smoke was worse on the first fold: threshold `0.7/0.45` gave set F1 `0.701`, rest false-active/min `1.07`; threshold `0.6/0.35` gave set F1 `0.738`, rest false-active/min `1.54`.
+- Candidate set confirmation in the full pipeline reduced rest-only false reps from `346` to `79`, but worsened Count MAE from `2.90` to `3.72` and only reduced rest-tail overlap reps from `131` to `110`.
+- Event-level confirmation with `--event-confirm-min-reps 2` improved the tradeoff compared with hard `min_confirmed_reps=3`: fixed-lag soft x0.8 Rep F1 `0.654`, Count MAE `3.32`, rest false reps `145`, rest-tail overlap reps `112`.
+- Periodic active gating is a better full-session baseline than the legacy active detector: fixed-lag soft x0.8 Rep F1 `0.712`, Count MAE `2.64`, Phase IoU `0.538`, C/E MAE `0.965`, rest false reps `254`.
+- Best current user-context tradeoff is periodic active + event confirmation with `min_reps=2` and `gap=1000`: Rep F1 `0.708`, Count MAE `2.65`, C/E MAE `0.902`, rest false reps `133`, rest-tail overlap reps `145`.
+- Adding action-lock evidence (`top_conf>=0.35`, `margin>=0.05`) is a safer mode with rest false reps `78`, but under-counts more: Rep F1 `0.695`, Count MAE `3.14`.
+- Added strict appended-rest metrics that split old rest overlap into boundary-crossing reps, new rest reps, and post-grace rest reps. A two-fold debug run found `34` old overlap reps but only `11` new rest reps and `3` post-grace rest reps after a 2s grace.
+- Full 9-fold strict-rest rerun for periodic active + event min2 + gap1000 reached Rep F1 `0.706`, Count MAE `2.65`, C/E MAE `0.930`, rest false reps `137`, old rest-tail overlap reps `146`, boundary-crossing reps `104`, new rest reps `42`, and post-2s-grace rest reps `8`.
+- Added per-stream full-session diagnostics to `scripts/evaluate_realtime_soft_top5_pipeline.py`: active coverage, active segment counts, compact event-confirmation summaries, and optional debug reps/segments through `--store-debug-reps`. A new `--only-subjects` option supports targeted held-out-subject debug reruns.
+- Diagnosed `db_biceps_curl` excluding yanz: cropped active-set fixed-lag soft x0.8 is strong (`MAE 0.24`, `Rep F1 0.976`), while full-session periodic + event gap1000 drops to `MAE 1.04`, `Rep F1 0.819`. Event confirmation was not the cause; biceps errors had `dropped_reps=0` and were missing before event filtering.
+- Minimal hsianshun biceps ablation found the first big regression at the stricter full-session active gate, before event confirmation: cropped-like legacy `threshold=0.5` had `24/27` reps, `MAE 1.00`, `Rep F1 0.902`; legacy `threshold=0.7` soft-online dropped to `6/27`, `MAE 7.00`, `Rep F1 0.218`; periodic `threshold=0.7` recovered partially to `12/27`, `MAE 5.00`, `Rep F1 0.390`. Event gap1000 did not change the periodic biceps count.
+- Targeted non-yanz biceps debug on `_tsenyu_temp`, `hsianshun`, and `kevin` showed active-mask fragmentation as the cause. Baseline periodic `threshold=0.7` with no bridge had biceps `MAE 2.44`, `Rep F1 0.537`; adding `--active-mask-bridge-samples 300` improved to `MAE 1.56`, `Rep F1 0.872`; lowering threshold to `0.6` with the same bridge improved to `MAE 1.22`, `Rep F1 0.896`. Full 9-fold rest-safety validation is still needed before changing the mainline.
+
+### Takeaway
+- Periodicity features help but do not solve active gating, because rest-after-set transitions can look rep-like.
+- The CNN active segmenter learns workout-set continuity better than RF windows, but needs a softer verifier; hard segment rejection improves precision while losing too much recall.
+- Event-level confirmation can share the action-lock delay and retroactively release buffered reps, but min-rep-only confirmation is still a secondary filter rather than the final active/rest solution.
+- For realistic realtime use, use periodic active gating plus event-level buffered release as the next mainline. A wide event gap is necessary because real sets can include long pauses; too-narrow event groups split true sets and under-count.
+- Rest-tail evaluation should use post-grace new rest reps rather than raw overlap reps. Most debug overlap cases are final reps crossing the set/rest boundary, which should be backdated instead of suppressed.
+- After strict metric splitting, set-tail leakage is much less severe than raw overlap suggested. The next blocker is rest-only false bursts plus implementing live set-closing grace/backdating.
+- Candidate confirmation is a useful secondary filter, not the primary fix.
+- The biceps curl full-session regression is mostly an active-gate setting problem, not proof that biceps is intrinsically bad in bounded-latency inference. The first large drop appears when moving from the cropped-like `threshold=0.5` active context to stricter full-session gating around `threshold=0.7`; periodic features and bridge/hysteresis can recover part of it, but threshold/hysteresis should be isolated before modifying the phase CNN.
+- The next serious fix should use event-level candidate scoring on full `set + rest_after_set` timelines, combining active CNN, periodic/RF evidence, phase alternation quality, and action confidence rather than a single binary gate.
+
+---
+
+## 2026-06-03 - Corrected Fixed-Lag Soft Top5 Realtime Integration
+
+### What Changed
+- Updated `scripts/evaluate_realtime_soft_top5_pipeline.py` so the bounded-latency path matches the phase-latency ablation decoder: trailing-window phase posterior, causal `MA25`, then fixed-lag Viterbi.
+- Added fixed-lag soft top5 threshold-scale variants through `--merge-threshold-scales`.
+- Documented the corrected result in `docs/experiments/2026-06-03-realtime-soft-top5-replay.md`.
+
+### Results
+- 9-fold e5/h64 with `phase_step=10`, `fixed_lag_samples=100`, and action RF posterior gating saved to `artifacts/action_recognition/realtime_soft_top5/summary_fixed_lag100_soft_corrected_e5_h64.json`.
+- Strict 0-lag online remains poor: raw Rep F1 `0.452`, Count MAE `5.20`, Phase IoU-F1@50 `0.195`.
+- Corrected fixed-lag raw reached Rep F1 `0.791`, Exact Count `0.359`, Count MAE `1.71`, Phase IoU-F1@50 `0.631`, C/E MAE `0.745`.
+- Best soft merge variant was `fixed_lag_soft_x0.8`: Rep F1 `0.825`, Exact Count `0.427`, Count MAE `1.34`, Phase IoU-F1@50 `0.631`, C/E MAE `0.700`.
+- Larger merge thresholds improved C/E MAE further but hurt count stability: `x1.2` had C/E MAE `0.661` but Count MAE `1.95`.
+- 20-epoch follow-up saved to `artifacts/action_recognition/realtime_soft_top5/summary_fixed_lag100_soft_corrected_e20_h64.json`: fixed-lag raw reached Rep F1 `0.809`, Exact Count `0.309`, Count MAE `1.87`, Phase IoU-F1@50 `0.662`, C/E MAE `0.779`.
+- In the same 20-epoch run, `fixed_lag_soft_x0.8` remained best for count stability: Rep F1 `0.846`, Exact Count `0.400`, Count MAE `1.43`, Phase IoU-F1@50 `0.662`, C/E MAE `0.735`.
+
+### Takeaway
+- The automatic pipeline is still not 0-lag realtime ready, but it now has a credible bounded-latency candidate with `1.0s` fixed label delay.
+- Use `fixed-lag Viterbi + soft top5 x0.8` as the current bounded-latency deployment candidate.
+- Next work should tune confirmed-transition rep finalization and duration-aware merging to recover Exact Count without losing the Count MAE gain.
+
+### Full-Session Gate Follow-Up
+- Extended `scripts/evaluate_realtime_soft_top5_pipeline.py` with rest-only and `set + rest tail` checks, active-masked fixed-lag parsing, optional active hysteresis, active-burst filtering, and optional action-active gate.
+- A 9-fold e5/h64 full-session safety check with `active_threshold=0.7` failed the deployment gate: `fixed_lag_soft_x0.8` dropped to Rep F1 `0.651`, Count MAE `2.90`, Phase IoU-F1@50 `0.489`, and still produced `346` false reps across `274` rest streams plus `131` rest-overlap reps across `181` appended-rest streams.
+- One-fold smoke tests showed that action-active gating can reduce appended-rest overlap but misses too much real motion; `active_threshold=0.7` plus `action_active_gate_threshold=0.75` had Rep F1 `0.310` and Count MAE `7.04` on `_tsenyu_temp` e1/h16.
+- Conclusion revised: `fixed-lag Viterbi + soft top5 x0.8` is the best bounded-latency decoder for active/cropped sets, but complete automatic realtime use is blocked by active gating/rest suppression.
+
+---
+
+## 2026-06-03 - Phase Latency Ablation
+
+### What Changed
+- Added `scripts/evaluate_phase_latency_ablation.py` to isolate why strict realtime replay failed.
+- Compared offline `predict_fast`, trailing-window causal probabilities with a stateful parser, causal MA25 smoothing, full-sequence Viterbi diagnostic upper bound, and simple 1s centered smoothing.
+- Documented the result in `docs/experiments/2026-06-03-phase-latency-ablation.md`.
+
+### Results
+- 9-fold e5/h64: offline `predict_fast` reached Rep F1 `0.804`, Count MAE `2.00`, Phase IoU-F1@50 `0.644` under corrected global active detection.
+- Causal raw stateful parser dropped to Rep F1 `0.697`, Count MAE `3.40`, Phase IoU-F1@50 `0.594`.
+- Causal past MA25 plus offline parser recovered much of the gap: Rep F1 `0.791`, Count MAE `2.02`, Phase IoU-F1@50 `0.613`.
+- Full-sequence Viterbi on trailing probabilities was a strong diagnostic upper bound: Rep F1 `0.805`, Count MAE `1.78`, Phase IoU-F1@50 `0.628`.
+- Added fixed-lag Viterbi with legal bounded future context. Both 0.5s and 1.0s lag reached Rep F1 `0.810`, Count MAE `1.78`; 1.0s lag had Phase IoU-F1@50 `0.637` and C/E MAE `0.787`.
+- Simple 1s centered smoothing did not win overall: Rep F1 `0.756`, Count MAE `2.48`, Phase IoU-F1@50 `0.586`, though a step-1 single-fold check showed it can help when tuned.
+
+### Takeaway
+- The strict realtime failure is mostly a decoder/state-machine problem, not proof that the phase CNN cannot support streaming use.
+- Fixed-lag Viterbi is now the best bounded-latency realtime decoder: it reproduces offline Rep F1/Count MAE with 0.5-1.0s delay.
+- Next target: connect fixed-lag Viterbi to the full automatic soft-top5 pipeline and improve Exact Count with confirmed-transition rep finalization.
+
+---
+
+## 2026-06-03 - Realtime Soft Top5 Replay
+
+### What Changed
+- Added `scripts/evaluate_realtime_soft_top5_pipeline.py` for strict streaming-style replay of the current global-active + soft top5 direction.
+- The script uses trailing windows for global active detection, action posterior updates, and phase CNN inference, plus a stateful C/E rep parser and delayed one-rep soft merge.
+- Documented the result in `docs/experiments/2026-06-03-realtime-soft-top5-replay.md`.
+
+### Results
+- 9-fold 5-epoch sanity with `phase_step=10`: raw online Rep F1 `0.455`, Count MAE `5.22`, Phase IoU-F1@50 `0.196`, C/E MAE `1.902`.
+- Soft online did not improve count under strict streaming: Rep F1 `0.454`, Count MAE `5.36`, Phase IoU-F1@50 `0.196`, C/E MAE `1.879`.
+- A one-fold `phase_step=1` smoke improved Count MAE (`4.00 -> 2.28` on `_tsenyu_temp` e1/h16) but Phase IoU remained low (`0.372`).
+
+### Takeaway
+- The current model is not fully automatic realtime ready.
+- The main gap is now online active/phase decoding, not the soft top5 merge policy.
+- Prioritize a streaming-native active state machine and causal phase smoothing/hysteresis before rerunning 20-epoch realtime claims.
+
+---
+
+## 2026-06-03 - Predicted-Action Top5 Integration
+
+### What Changed
+- Added `scripts/evaluate_predicted_action_top5_pipeline.py` to connect the dual-head RF action branch to the existing `raw6 CNN + top5_p5` decoder.
+- The script compares `raw`, oracle `top5_p5`, and predicted-action `top5_p5` under 9-fold held-out-subject evaluation with fallback to raw decoding when no action lock is available.
+- Documented the integration run in `docs/experiments/2026-06-03-predicted-action-top5-integration.md`.
+
+### Results
+- `stricter_a075_p070_m020_s4`: action lock rate `0.641`, locked action accuracy `0.957`, median lock time `5.0s`.
+- Fixed an evaluation-design issue: the legacy active detector was per-action and selected by true action from `stream_id`. The integration script now defaults to a global action-agnostic active detector trained on all train-fold sets plus rest/non-action streams.
+- With corrected global active detection, raw reached Rep F1 `0.801`, Count MAE `1.973`, Phase IoU-F1@50 `0.639`, C/E MAE `0.861`.
+- Hard `stricter` predicted-action top5 was not enough under global active detection: Rep F1 `0.802`, Count MAE `1.968`, C/E MAE `0.835`.
+- Soft posterior-gated top5 still improved the corrected pipeline: Rep F1 `0.823`, Count MAE `1.691`, C/E MAE `0.806`, close to corrected oracle top5 Count MAE `1.641`.
+- The earlier per-action-active run was optimistic: soft top5 had Rep F1 `0.860`, Count MAE `1.118`, C/E MAE `0.585`, close to oracle top5 Rep F1 `0.867`, Count MAE `1.027`, C/E MAE `0.579`.
+- `very_strict_a080_p075_m020_s5` had higher locked accuracy `0.983`, but lower lock rate `0.527`; hard predicted top5 did not improve Count MAE enough (`1.591 -> 1.532`) and worsened Exact Count (`0.541 -> 0.523`) in that run.
+
+### Takeaway
+- Hard predicted action should not directly control `top5_p5`; soft posterior-gated merging is much safer and recovers most of the oracle benefit in the 5-epoch integration run.
+- Keep `global active + stricter + soft_top5` as the next engineering integration candidate, not yet as a deployment-ready default.
+- Active segmentation is now the major bottleneck for full automation; improve and validate it before claiming automatic deployment readiness.
+- Rerun soft top5 with the 20-epoch deployment-quality phase setting and add full-session rest/prep false-positive checks before claiming automatic deployment readiness.
+
+---
+
+## 2026-06-03 - Dual-Head RF Action Recognition Probe
+
+### What Changed
+- Added `scripts/evaluate_dual_head_rf_action_loso.py` to evaluate a first window-based dual-head Random Forest action branch.
+- Head 1 predicts `workout_action` vs `non_action`; head 2 predicts the 8 known actions only for workout windows.
+- Included `big_rest`, `rest_after_set*`, and non-active phase windows as `non_action` negatives.
+- Documented the experiment in `docs/experiments/2026-06-03-dual-head-rf-action-probe.md`.
+
+### Results
+- 9-fold held-out-subject probe with 200-sample windows and 100-sample stride:
+  - Active F1 `0.854`, active macro F1 `0.905`.
+  - True-active action accuracy `0.810`, macro F1 `0.790`.
+  - Set-level action lock rate `0.845`, locked-stream accuracy `0.912`, median lock time `4.0s`.
+  - Non-action false-lock rate `0.315`, which is too high for deployment control.
+- Lock-policy search on the same RF probabilities reduced false locks:
+  - `stricter_a075_p070_m020_s4`: false-lock `0.135`, action lock rate `0.641`, lock accuracy `0.956`, median lock time `5.0s`.
+  - `very_strict_a080_p075_m020_s5`: false-lock `0.082`, action lock rate `0.528`, lock accuracy `0.985`, median lock time `6.28s`.
+  - `ultra_a085_p080_m025_s5`: false-lock `0.056`, action lock rate `0.432`, lock accuracy `0.990`, median lock time `6.28s`.
+
+### Takeaway
+- The dual-head active/action design is viable as a parallel action branch baseline, but the current RF lock policy is too permissive.
+- Use `stricter_a075_p070_m020_s4` as the balanced next candidate and `very_strict_a080_p075_m020_s5` as a safety candidate.
+- Do not feed predicted action into `top5_p5` yet; first rerun the full rep pipeline with a fallback path for unlocked/unknown action context.
+
+---
+
+## 2026-06-03 - Dual-Head CNN Action Recognition Probe
+
+### What Changed
+- Added `scripts/evaluate_dual_head_cnn_action_loso.py` to test a tiny causal Conv1D dual-head model under the same LOSO/window/non-action protocol as the RF probe.
+- Ran a 3-epoch hidden-32 CNN probe with default lock and a conservative active-weight/strict-lock variant.
+- Documented the comparison in `docs/experiments/2026-06-03-dual-head-cnn-action-probe.md`.
+
+### Results
+- CNN default lock: active F1 `0.801`, true-active action accuracy `0.813`, lock accuracy `0.882`, non-action false-lock `0.609`.
+- CNN conservative active + strict lock: active F1 `0.798`, true-active action accuracy `0.818`, lock accuracy `0.928`, non-action false-lock `0.334`.
+- RF strict lock remains better for deployment gating: active F1 `0.854`, true-active action accuracy `0.810`, lock accuracy `0.945`, non-action false-lock `0.195`.
+
+### Takeaway
+- The tiny CNN slightly improves action classification on true-active windows, but it is worse at rejecting non-action windows.
+- Keep RF as the current action-branch baseline; do not use this CNN to control `top5_p5` until active/rejection calibration improves.
+
+---
+
+## 2026-06-02 - Raw6 CNN Deployment Export Path
+
+### What Changed
+- Added `scripts/export_raw6_cnn_deploy.py` for the intended deployment target: raw6 phase-only 1D causal CNN plus `top5_p5` decoder metadata.
+- Added `scripts/stream_raw6_cnn_top5_p5.py` to run the exported CNN artifact on saved workout CSV rows or `zig_bt_client --stdout` raw IMU rows.
+- Added `scripts/export_raw6_cnn_rknn_onnx.py` and `scripts/convert_raw6_cnn_to_rknn.py` for Luckfox Pico Zero / RV1103 RKNN conversion.
+- Documented the deployment artifact and commands in `docs/experiments/2026-06-02-cnn-deployment-export.md` and `docs/experiments/2026-06-02-rknn-luckfox-pico-zero.md`.
+
+### Takeaway
+- Deployment should use `artifacts/deploy/raw6_cnn_top5_p5_current/` after running the CNN export script, not the per-action RF artifact.
+- The live CNN path assumes a known action and an active set interval; rest-aware full-session gating is still pending.
+
+---
+
 ## 2026-05-26 - Deployable Per-Action RF Export
 
 ### What Changed

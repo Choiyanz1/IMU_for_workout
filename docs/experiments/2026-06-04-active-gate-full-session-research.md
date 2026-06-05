@@ -279,6 +279,40 @@ Active-mask bridging smoke on the same selected folds:
 
 Interpretation: the full-session biceps regression is mostly caused by stricter active gating under-covering and then fragmenting smooth/low-amplitude biceps motion. Bridging short inactive gaps recovers much of the lost biceps phase quality and rep matching, but the simpler root-cause ablation says we should first revisit the active threshold/hysteresis policy before treating bridge as the main fix. This needs a full 9-fold check because lower thresholds or bridge settings can increase rest-only false positives, but biceps should not be treated as a fundamental phase-model failure.
 
+## Action-Head `other` as Set-State Evidence
+Question: can the action branch's active/non-action head help the system exit the current exercise mode or reject rest candidates? A two-fold smoke ablation on `_tsenyu_temp` and `_ziho_temp` tested three ways of using that head in the current full-session mainline (`periodic active`, `event min2`, `gap1000`, `fixed_lag_soft_x0.8`).
+
+Commands used the same baseline as above plus one of:
+
+```sh
+--action-active-gate-threshold 0.35
+```
+
+or:
+
+```sh
+--event-confirm-action-active-threshold 0.5 \
+--event-confirm-action-active-min-fraction 0.2 \
+--event-confirm-action-active-min-max 0.35
+```
+
+or softer event evidence:
+
+```sh
+--event-confirm-action-active-threshold 0.5 \
+--event-confirm-action-active-min-fraction 0.1 \
+--event-confirm-action-active-min-max 0.25
+```
+
+| Setting | Rep F1 | Exact | Count MAE | Phase IoU | C/E MAE | Rest False Reps | Rest Streams False | Tail Overlap | Tail New Rest | Tail Post-Grace |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline event min2 gap1000 | `0.617` | `0.200` | `3.30` | `0.455` | `0.840` | `38` | `10` | `35` | `12` | `4` |
+| hard action-active gate `0.35` | `0.575` | `0.080` | `4.10` | `0.404` | `0.877` | `29` | `9` | `33` | `12` | `5` |
+| event action-active evidence | `0.578` | `0.220` | `3.76` | `0.423` | `0.854` | `12` | `4` | `2` | `1` | `0` |
+| softer event action-active evidence | `0.581` | `0.160` | `3.88` | `0.419` | `0.823` | `10` | `3` | `2` | `1` | `0` |
+
+Interpretation: the `other` head is useful, but not as a per-window hard gate. Hard action-active gating reduced rest false reps only modestly (`38 -> 29`) while worsening Count MAE (`3.30 -> 4.10`) and Rep F1 (`0.617 -> 0.575`). Event-level use is much safer for rest rejection: it cut rest false reps to `10-12` and nearly eliminated appended-tail new-rest reps (`12 -> 1`), but still worsened workout-set count (`MAE 3.76-3.88`). This supports using the action active/non-action head as set-level confirmation/exit evidence, not as the primary active mask. The next version should score candidate events with action-active evidence plus phase alternation quality and active continuity, rather than immediately dropping events based only on action-active thresholds.
+
 ## Interpretation
 - The current gate fails because it detects motion, not confirmed workout-set structure.
 - Periodicity helps but rest-after-set can contain periodic-looking transitions.
@@ -295,4 +329,4 @@ Interpretation: the full-session biceps regression is mostly caused by stricter 
 - H2: Add phase-CNN uncertainty/entropy and rep regularity as confirmation features, because false rest reps should have weaker sustained C/E alternation quality than real sets.
 - H3: Use action lock as a set-level verifier after candidate set onset, not as a per-window gate. Per-window action-active gating was too harsh.
 - H4: For deployment, use a candidate buffer: do not display reps until a set is confirmed, then release buffered reps; if the candidate expires, drop it.
-- H5: Replace hard CNN+RF segment rejection with softer candidate scoring. Candidate active starts from CNN, but final set confirmation should combine periodic/RF, phase-quality evidence, and action confidence rather than immediately deleting weak segments.
+- H5: Replace hard CNN+RF/action-active segment rejection with softer candidate scoring. Candidate active starts from CNN or periodic RF, but final set confirmation should combine periodic/RF, action-active evidence, phase-quality evidence, and action confidence rather than immediately deleting weak segments.
